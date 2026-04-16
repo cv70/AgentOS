@@ -1,0 +1,43 @@
+server:
+  host: 0.0.0.0
+  port: 8787
+
+storage:
+  data_dir: ./data
+  state_file: agentos.db
+
+runtime:
+  max_concurrent_tasks: 3
+  session_window_size: 16
+  memory_search_limit: 8
+
+sandbox:
+  allowed_programs: ["sh", "bash", "ls", "pwd", "find", "printf", "echo", "cat", "head", "sed"]
+  allowed_working_dirs: ["/root/space", "/tmp"]
+  allowed_env: ["PATH", "HOME", "USER", "LANG", "TERM"]
+  max_output_bytes: 32768
+  profiles:
+    - id: read-only
+      writable: false
+      allowed_working_dirs: ["/root/space"]
+      allowed_programs: ["sh", "bash", "ls", "pwd", "find", "cat", "head", "sed", "echo", "printf"]
+    - id: workspace-write
+      writable: true
+      allowed_working_dirs: ["/root/space"]
+      allowed_programs: ["sh", "bash", "ls", "pwd", "find", "cat", "head", "sed", "echo", "printf"]
+    - id: tmp-only
+      writable: true
+      allowed_working_dirs: ["/tmp"]
+      allowed_programs: ["sh", "bash", "ls", "pwd", "find", "cat", "head", "sed", "echo", "printf"]
+
+models:
+  default_model: local-phi4
+  providers:
+    - id: local-phi4
+      kind: local
+      endpoint: http://localhost:11434
+      capabilities: [chat, summarize, code]
+    - id: openai-gpt-5.2
+      kind: remote-api
+      endpoint: https://api.openai.com/v1
+      capabilities: [chat, planning, tools]

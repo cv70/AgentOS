@@ -1,0 +1,83 @@
+{
+  "tasks": [
+    {
+      "id": "1d21d7a2-901b-48cc-b3bc-aefa1035178d",
+      "title": "索引工作区",
+      "description": "扫描当前项目目录并建立本地知识索引。",
+      "priority": "HIGH",
+      "status": "RUNNING",
+      "sandbox_profile": "workspace-write",
+      "resources": {
+        "cpu": 4,
+        "memory_mb": 2048,
+        "timeout_secs": 1800
+      },
+      "working_dir": "/workspace",
+      "created_at": "2026-04-18T10:25:25.309669812Z",
+      "updated_at": "2026-04-18T10:25:25.309763581Z"
+    },
+    {
+      "id": "b4dd276b-e08f-40d7-b4aa-6b3349d8bc04",
+      "title": "预热工具插件",
+      "description": "检查 Skill 元数据并启用热加载。",
+      "priority": "NORMAL",
+      "status": "PENDING",
+      "sandbox_profile": "read-only",
+      "resources": {
+        "cpu": 2,
+        "memory_mb": 1024,
+        "timeout_secs": 1200
+      },
+      "working_dir": "/workspace/.skills",
+      "created_at": "2026-04-18T10:25:25.309756812Z",
+      "updated_at": "2026-04-18T10:25:25.309756812Z"
+    }
+  ],
+  "sessions": [
+    {
+      "id": "fd26e14d-e3d0-4371-8717-1c4d4cf08f67",
+      "title": "默认工作会话",
+      "working_dir": "/workspace",
+      "messages": [
+        {
+          "id": "caece3a6-26a8-4bb7-9e34-f7f89dd253e9",
+          "role": "system",
+          "content": "AgentOS 已启动，优先使用本地资源并记录可追溯审计信息。",
+          "created_at": "2026-04-18T10:25:25.309830119Z"
+        }
+      ],
+      "summary": {
+        "pinned_decisions": [
+          "默认保留关键任务约束与用户偏好"
+        ],
+        "compressed_context": "会话刚创建，尚未触发摘要压缩。"
+      },
+      "created_at": "2026-04-18T10:25:25.309765196Z",
+      "updated_at": "2026-04-18T10:25:25.309832273Z"
+    }
+  ],
+  "memories": [
+    {
+      "id": "ebb3eefc-81c3-4792-85d3-0b4a98e1474f",
+      "scope": "LONG_TERM",
+      "title": "用户偏好",
+      "content": "默认使用中文回复，并优先在本地执行任务。",
+      "tags": [
+        "preference",
+        "locale"
+      ],
+      "created_at": "2026-04-18T10:25:25.309838427Z"
+    },
+    {
+      "id": "9c4f2a44-fcbf-490c-8e49-3f73d6b4cd1f",
+      "scope": "SEMANTIC",
+      "title": "系统原则",
+      "content": "工具执行遵循最小权限、可观测性和优雅降级。",
+      "tags": [
+        "policy",
+        "runtime"
+      ],
+      "created_at": "2026-04-18T10:25:25.309844196Z"
+    }
+  ]
+}
