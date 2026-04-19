@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use reqwest::Client;
@@ -39,6 +39,15 @@ use crate::domain::tool::{
 };
 use crate::error::{AppError, AppResult};
 use crate::executor::sandbox::{SandboxExecutor, apply_execution_result};
+use crate::runtime::scheduler::{
+    InMemoryScheduler, SharedScheduler, pop_next_if_capacity, remove_running, requeue_front,
+    try_mark_running,
+};
+use crate::runtime::validation::{
+    validate_append_message_request, validate_create_memory_request,
+    validate_create_session_request, validate_create_task_request, validate_search_query,
+};
+use crate::runtime::workspace_context::WorkspaceContextProvider;
 use crate::storage::sqlite_store::{PersistedState, SqliteStore};
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +69,14 @@ pub struct SchedulerSnapshot {
     pub queue_depth: usize,
     pub running: usize,
     pub paused: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SchedulerStatus {
+    pub max_concurrent_tasks: usize,
+    pub running_task_ids: Vec<Uuid>,
+    pub queued_task_ids: Vec<Uuid>,
+    pub available_slots: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +147,8 @@ pub struct AgentRuntime {
     llm_client: Client,
     default_model: Arc<RwLock<String>>,
     skill_roots: Arc<Vec<PathBuf>>,
+    scheduler: SharedScheduler,
+    workspace_contexts: WorkspaceContextProvider,
 }
 
 impl AgentRuntime {
@@ -141,6 +160,8 @@ impl AgentRuntime {
             llm_client: Client::new(),
             default_model: Arc::new(RwLock::new(config.models.default_model.clone())),
             skill_roots: Arc::new(default_skill_roots()),
+            scheduler: Arc::new(Mutex::new(InMemoryScheduler::default())),
+            workspace_contexts: WorkspaceContextProvider::new(),
             config,
             store,
         };
@@ -775,7 +796,7 @@ impl AgentRuntime {
                     .get("working_dir")
                     .and_then(Value::as_str)
                     .unwrap_or(&session.working_dir);
-                let results = discover_workspace_contexts(working_dir);
+                let results = self.workspace_contexts.list(working_dir);
                 tool_trace.push(HermesToolEvent {
                     tool: "workspace-context".to_string(),
                     detail: format!("llm loaded {} context files", results.len()),
@@ -906,6 +927,11 @@ impl AgentRuntime {
 
     pub async fn route_model(&self, input: RouteModelRequest) -> AppResult<ModelRouteDecision> {
         let capability = input.capability.trim().to_lowercase();
+        if capability.is_empty() {
+            return Err(AppError::Validation(
+                "model capability must not be empty".to_string(),
+            ));
+        }
         let mut ranked = self.models().await;
         ranked.retain(|model| {
             model
@@ -966,10 +992,7 @@ impl AgentRuntime {
         let sessions = self.store.list_sessions().await?;
         let memories = self.store.list_memories().await?;
         let skills = self.skills();
-        let running = tasks
-            .iter()
-            .filter(|task| task.status == TaskStatus::Running)
-            .count();
+        let scheduler = self.scheduler_status().await?;
         let paused = tasks
             .iter()
             .filter(|task| task.status == TaskStatus::Paused)
@@ -979,11 +1002,8 @@ impl AgentRuntime {
             node_name: "agentos-local-node".to_string(),
             scheduler: SchedulerSnapshot {
                 max_concurrent_tasks: self.config.runtime.max_concurrent_tasks,
-                queue_depth: tasks
-                    .iter()
-                    .filter(|task| task.status == TaskStatus::Pending)
-                    .count(),
-                running,
+                queue_depth: scheduler.queued_task_ids.len(),
+                running: scheduler.running_task_ids.len(),
                 paused,
             },
             sessions: SessionSnapshot {
@@ -1006,11 +1026,32 @@ impl AgentRuntime {
         })
     }
 
+    pub async fn scheduler_status(&self) -> AppResult<SchedulerStatus> {
+        let scheduler = self
+            .scheduler
+            .lock()
+            .map_err(|_| AppError::Runtime("scheduler mutex poisoned".to_string()))?;
+        let running_task_ids = scheduler.running.iter().copied().collect::<Vec<_>>();
+        let queued_task_ids = scheduler.queued.iter().copied().collect::<Vec<_>>();
+        let available_slots = self
+            .config
+            .runtime
+            .max_concurrent_tasks
+            .saturating_sub(running_task_ids.len());
+        Ok(SchedulerStatus {
+            max_concurrent_tasks: self.config.runtime.max_concurrent_tasks,
+            running_task_ids,
+            queued_task_ids,
+            available_slots,
+        })
+    }
+
     pub async fn list_tasks(&self) -> AppResult<Vec<AgentTask>> {
         self.store.list_tasks().await
     }
 
     pub async fn create_task(&self, input: CreateTaskRequest) -> AppResult<AgentTask> {
+        validate_create_task_request(&input)?;
         let task = AgentTask::new(input);
         self.store.upsert_task(task.clone()).await?;
         Ok(task)
@@ -1038,59 +1079,44 @@ impl AgentRuntime {
             .await?
             .ok_or_else(|| AppError::NotFound(format!("task {}", task_id)))?;
         if task.status == TaskStatus::Running {
-            return Err(AppError::Runtime(format!(
+            return Err(AppError::Conflict(format!(
                 "task {} is already running",
                 task_id
             )));
         }
         self.executor.validate_task(&task)?;
-        let cancel_rx = self.executor.register_run(task_id).await?;
-        task.set_status(TaskStatus::Running);
-        self.store.upsert_task(task.clone()).await?;
-
-        let store = self.store.clone();
-        let executor = self.executor.clone();
-        let session_window_size = self.config.runtime.session_window_size;
-        tokio::spawn(async move {
-            let mut execution = match executor.run_task(&task, cancel_rx).await {
-                Ok(record) => record,
-                Err(error) => TaskExecutionRecord {
-                    id: Uuid::new_v4(),
-                    task_id: task.id,
-                    sandbox_profile: task.sandbox_profile.clone(),
-                    command_line: format!(
-                        "{} {}",
-                        task.command.program,
-                        task.command.args.join(" ")
-                    ),
-                    status: crate::domain::task::ExecutionStatus::Failed,
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: error.to_string(),
-                    duration_ms: 0,
-                    started_at: Utc::now(),
-                    finished_at: Utc::now(),
-                    working_dir: task.working_dir.clone(),
-                    audit_log: vec!["sandbox execution failed before child completion".to_string()],
-                },
-            };
-            let mut finished_task = task.clone();
-            apply_execution_result(&mut finished_task, &execution);
-            if matches!(
-                execution.status,
-                crate::domain::task::ExecutionStatus::Failed
-            ) && execution.audit_log.is_empty()
-            {
-                execution
-                    .audit_log
-                    .push("execution failed without audit trail".to_string());
+        let should_queue = {
+            let mut scheduler = self
+                .scheduler
+                .lock()
+                .map_err(|_| AppError::Runtime("scheduler mutex poisoned".to_string()))?;
+            if scheduler.running.contains(&task_id) || scheduler.queued.contains(&task_id) {
+                return Err(AppError::Conflict(format!(
+                    "task {} is already scheduled",
+                    task_id
+                )));
             }
-            let _ = store.upsert_task(finished_task).await;
-            let _ = store.add_task_execution(execution.clone()).await;
-            let _ = record_task_learning(&store, &task, &execution, session_window_size).await;
-            executor.finish_run(task_id).await;
-        });
 
+            if scheduler.running.len() >= self.config.runtime.max_concurrent_tasks {
+                scheduler.queued.push_back(task_id);
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_queue {
+            task.set_status(TaskStatus::Pending);
+            self.store.upsert_task(task.clone()).await?;
+            return Ok(TaskRunReceipt {
+                task_id,
+                status: TaskStatus::Pending,
+                message: "task queued and will start when scheduler capacity is available"
+                    .to_string(),
+            });
+        }
+
+        self.start_task_now(task).await?;
         Ok(TaskRunReceipt {
             task_id,
             status: TaskStatus::Running,
@@ -1104,6 +1130,31 @@ impl AgentRuntime {
             .get_task(task_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("task {}", task_id)))?;
+        let removed_from_queue = {
+            let mut scheduler = self
+                .scheduler
+                .lock()
+                .map_err(|_| AppError::Runtime("scheduler mutex poisoned".to_string()))?;
+            if let Some(position) = scheduler
+                .queued
+                .iter()
+                .position(|queued_id| *queued_id == task_id)
+            {
+                scheduler.queued.remove(position);
+                true
+            } else {
+                false
+            }
+        };
+        if removed_from_queue {
+            task.set_status(TaskStatus::Cancelled);
+            self.store.upsert_task(task).await?;
+            return Ok(TaskRunReceipt {
+                task_id,
+                status: TaskStatus::Cancelled,
+                message: "queued task removed before execution".to_string(),
+            });
+        }
         self.executor.cancel_task(task_id).await?;
         task.set_status(TaskStatus::Cancelled);
         self.store.upsert_task(task).await?;
@@ -1114,6 +1165,40 @@ impl AgentRuntime {
         })
     }
 
+    async fn start_task_now(&self, mut task: AgentTask) -> AppResult<()> {
+        let cancel_rx = self.executor.register_run(task.id).await?;
+        {
+            let mut scheduler = self
+                .scheduler
+                .lock()
+                .map_err(|_| AppError::Runtime("scheduler mutex poisoned".to_string()))?;
+            scheduler.queued.retain(|queued_id| *queued_id != task.id);
+            scheduler.running.insert(task.id);
+        }
+
+        task.set_status(TaskStatus::Running);
+        self.store.upsert_task(task.clone()).await?;
+
+        let store = self.store.clone();
+        let executor = self.executor.clone();
+        let scheduler = self.scheduler.clone();
+        let session_window_size = self.config.runtime.session_window_size;
+        let max_concurrent_tasks = self.config.runtime.max_concurrent_tasks;
+        tokio::spawn(async move {
+            run_task_in_background(
+                store,
+                executor,
+                scheduler,
+                task,
+                cancel_rx,
+                session_window_size,
+                max_concurrent_tasks,
+            )
+            .await;
+        });
+        Ok(())
+    }
+
     pub async fn task_execution_insights(&self, task_id: Uuid) -> AppResult<TaskExecutionInsights> {
         Ok(TaskExecutionInsights {
             task_id,
@@ -1122,11 +1207,19 @@ impl AgentRuntime {
         })
     }
 
+    pub async fn get_execution(&self, execution_id: Uuid) -> AppResult<TaskExecutionRecord> {
+        self.store
+            .get_task_execution(execution_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("execution {}", execution_id)))
+    }
+
     pub async fn list_sessions(&self) -> AppResult<Vec<AgentSession>> {
         self.store.list_sessions().await
     }
 
     pub async fn create_session(&self, input: CreateSessionRequest) -> AppResult<AgentSession> {
+        validate_create_session_request(&input)?;
         let session = AgentSession::new(input);
         self.store.upsert_session(session.clone()).await?;
         Ok(session)
@@ -1137,6 +1230,7 @@ impl AgentRuntime {
         session_id: Uuid,
         input: AppendMessageRequest,
     ) -> AppResult<AgentSession> {
+        validate_append_message_request(&input)?;
         let mut session = self
             .store
             .get_session(session_id)
@@ -1151,6 +1245,7 @@ impl AgentRuntime {
         &self,
         input: SearchSessionRequest,
     ) -> AppResult<Vec<SessionSearchResult>> {
+        validate_search_query(&input.query, "session query")?;
         self.store
             .search_sessions(&input.query, input.limit.unwrap_or(8))
             .await
@@ -1161,6 +1256,7 @@ impl AgentRuntime {
     }
 
     pub async fn create_memory(&self, input: CreateMemoryRequest) -> AppResult<MemoryEntry> {
+        validate_create_memory_request(&input)?;
         let memory = MemoryEntry::new(input);
         self.store.upsert_memory(memory.clone()).await?;
         Ok(memory)
@@ -1170,6 +1266,7 @@ impl AgentRuntime {
         &self,
         input: SearchMemoryRequest,
     ) -> AppResult<Vec<MemorySearchResult>> {
+        validate_search_query(&input.query, "memory query")?;
         self.store
             .search_memories(&input.query, self.config.runtime.memory_search_limit)
             .await
@@ -1180,6 +1277,11 @@ impl AgentRuntime {
         skill_id: &str,
         input: RunSkillRequest,
     ) -> AppResult<SkillExecutionResult> {
+        if skill_id.trim().is_empty() {
+            return Err(AppError::Validation(
+                "skill id must not be empty".to_string(),
+            ));
+        }
         let skill = self
             .skills()
             .into_iter()
@@ -1386,7 +1488,94 @@ impl AgentRuntime {
         working_dir: Option<String>,
     ) -> AppResult<Vec<WorkspaceContextFile>> {
         let cwd = working_dir.unwrap_or_else(|| "/root/space".to_string());
-        Ok(discover_workspace_contexts(&cwd))
+        Ok(self.workspace_contexts.list(&cwd))
+    }
+}
+
+async fn run_task_in_background(
+    store: SqliteStore,
+    executor: SandboxExecutor,
+    scheduler: Arc<Mutex<InMemoryScheduler>>,
+    mut task: AgentTask,
+    cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    session_window_size: usize,
+    max_concurrent_tasks: usize,
+) {
+    let mut cancel_rx = Some(cancel_rx);
+    loop {
+        let mut execution = match executor
+            .run_task(
+                &task,
+                cancel_rx
+                    .take()
+                    .expect("cancel receiver should exist for scheduled task"),
+            )
+            .await
+        {
+            Ok(record) => record,
+            Err(error) => TaskExecutionRecord {
+                id: Uuid::new_v4(),
+                task_id: task.id,
+                sandbox_profile: task.sandbox_profile.clone(),
+                command_line: format!("{} {}", task.command.program, task.command.args.join(" ")),
+                status: crate::domain::task::ExecutionStatus::Failed,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: error.to_string(),
+                duration_ms: 0,
+                started_at: Utc::now(),
+                finished_at: Utc::now(),
+                working_dir: task.working_dir.clone(),
+                audit_log: vec!["sandbox execution failed before child completion".to_string()],
+            },
+        };
+        let mut finished_task = task.clone();
+        apply_execution_result(&mut finished_task, &execution);
+        if matches!(
+            execution.status,
+            crate::domain::task::ExecutionStatus::Failed
+        ) && execution.audit_log.is_empty()
+        {
+            execution
+                .audit_log
+                .push("execution failed without audit trail".to_string());
+        }
+        let _ = store.upsert_task(finished_task).await;
+        let _ = store.add_task_execution(execution.clone()).await;
+        let _ = record_task_learning(&store, &task, &execution, session_window_size).await;
+        executor.finish_run(task.id).await;
+        remove_running(&scheduler, task.id);
+
+        let Some(next_task_id) = pop_next_if_capacity(&scheduler, max_concurrent_tasks) else {
+            return;
+        };
+
+        let Some(mut next_task) = store.get_task(next_task_id).await.ok().flatten() else {
+            continue;
+        };
+        if next_task.status == TaskStatus::Cancelled {
+            continue;
+        }
+
+        let Ok(next_cancel_rx) = executor.register_run(next_task.id).await else {
+            continue;
+        };
+
+        if !try_mark_running(&scheduler, next_task.id, max_concurrent_tasks) {
+            requeue_front(&scheduler, next_task.id);
+            executor.finish_run(next_task.id).await;
+            return;
+        }
+
+        next_task.set_status(TaskStatus::Running);
+        if store.upsert_task(next_task.clone()).await.is_err() {
+            executor.finish_run(next_task.id).await;
+            remove_running(&scheduler, next_task.id);
+            continue;
+        }
+
+        task = next_task;
+        cancel_rx = Some(next_cancel_rx);
     }
 }
 
@@ -2727,85 +2916,6 @@ fn default_skill_roots() -> Vec<PathBuf> {
     ]
 }
 
-fn discover_workspace_contexts(working_dir: &str) -> Vec<WorkspaceContextFile> {
-    let base = PathBuf::from(working_dir);
-    let candidates = [
-        ("codex", "AGENTS.md"),
-        ("hermes", "SOUL.md"),
-        ("memory", "MEMORY.md"),
-        ("user", "USER.md"),
-        ("workspace", "README.md"),
-    ];
-
-    let mut contexts = candidates
-        .iter()
-        .filter_map(|(kind, file_name)| {
-            let path = base.join(file_name);
-            let raw = fs::read_to_string(&path).ok()?;
-            Some(parse_workspace_context(*kind, &path, &raw))
-        })
-        .collect::<Vec<_>>();
-
-    contexts.sort_by(|left, right| left.path.cmp(&right.path));
-    contexts
-}
-
-fn parse_workspace_context(kind: &str, path: &Path, raw: &str) -> WorkspaceContextFile {
-    let mut title = path
-        .file_name()
-        .and_then(|item| item.to_str())
-        .unwrap_or("context")
-        .to_string();
-    let mut excerpt_lines = Vec::new();
-    let mut guidance = Vec::new();
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with('#')
-            && title
-                == path
-                    .file_name()
-                    .and_then(|item| item.to_str())
-                    .unwrap_or("context")
-        {
-            title = trimmed.trim_start_matches('#').trim().to_string();
-            continue;
-        }
-        if excerpt_lines.len() < 3 && !trimmed.starts_with("- ") && !trimmed.starts_with("* ") {
-            excerpt_lines.push(trimmed.to_string());
-        }
-        if guidance.len() < 4 {
-            if let Some(item) = trimmed
-                .strip_prefix("- ")
-                .or_else(|| trimmed.strip_prefix("* "))
-            {
-                guidance.push(item.trim().to_string());
-                continue;
-            }
-            if let Some((_, item)) = trimmed.split_once(':') {
-                if trimmed.len() < 120 {
-                    guidance.push(item.trim().to_string());
-                }
-            }
-        }
-    }
-
-    if guidance.is_empty() && !excerpt_lines.is_empty() {
-        guidance.extend(excerpt_lines.iter().take(2).cloned());
-    }
-
-    WorkspaceContextFile {
-        kind: kind.to_string(),
-        path: path.display().to_string(),
-        title,
-        excerpt: excerpt_lines.join(" "),
-        guidance,
-    }
-}
-
 fn builtin_skills() -> Vec<SkillDescriptor> {
     vec![
         SkillDescriptor {
@@ -3041,6 +3151,11 @@ mod tests {
     };
     use crate::domain::agent::HermesAgentRequest;
     use crate::domain::learning::LearningCluster;
+    use crate::domain::memory::{CreateMemoryRequest, MemoryScope, SearchMemoryRequest};
+    use crate::domain::model::RouteModelRequest;
+    use crate::domain::session::{
+        AppendMessageRequest, CreateSessionRequest, MessageRole, SearchSessionRequest,
+    };
     use crate::domain::task::{
         AgentTask, CreateTaskRequest, ExecutionStatus, TaskCommand, TaskExecutionRecord,
         TaskPriority,
@@ -3049,8 +3164,8 @@ mod tests {
 
     use super::{
         AgentRuntime, build_chat_completions_endpoint, build_task_suggestions,
-        cluster_suppression_policy, discover_workspace_contexts, infer_capability,
-        infer_hermes_loop_capability, record_task_learning, unique_skill_dir,
+        cluster_suppression_policy, infer_capability, infer_hermes_loop_capability,
+        record_task_learning, unique_skill_dir,
     };
 
     fn test_config(data_dir: String) -> AppConfig {
@@ -3175,29 +3290,6 @@ mod tests {
                 .iter()
                 .any(|key| key == "tools::scan-index")
         }));
-    }
-
-    #[test]
-    fn workspace_context_discovery_detects_agents_file() {
-        let temp_dir = env::temp_dir().join(format!("agentos-context-test-{}", Uuid::new_v4()));
-        fs::create_dir_all(&temp_dir).expect("create temp dir");
-        fs::write(
-            temp_dir.join("AGENTS.md"),
-            "# Repo Rules\n- Use Rust\n- Prefer local execution\n",
-        )
-        .expect("write context file");
-
-        let contexts = discover_workspace_contexts(&temp_dir.to_string_lossy());
-        assert_eq!(contexts.len(), 1);
-        assert_eq!(contexts[0].kind, "codex");
-        assert!(
-            contexts[0]
-                .guidance
-                .iter()
-                .any(|item| item.contains("Prefer local"))
-        );
-
-        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
 
     #[tokio::test]
@@ -3554,6 +3646,126 @@ mod tests {
                 .iter()
                 .any(|event| event.strategy_source_key == "tools::scan-index")
         );
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_blank_title() {
+        let temp_dir = env::temp_dir().join(format!("agentos-validation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let runtime = AgentRuntime::new(test_config(temp_dir.to_string_lossy().to_string()))
+            .await
+            .expect("create runtime");
+
+        let error = runtime
+            .create_task(CreateTaskRequest {
+                title: "   ".to_string(),
+                description: "desc".to_string(),
+                priority: TaskPriority::Normal,
+                sandbox_profile: "read-only".to_string(),
+                command: TaskCommand {
+                    program: "sh".to_string(),
+                    args: vec!["-lc".to_string(), "pwd".to_string()],
+                },
+                working_dir: "/root/space".to_string(),
+                strategy_sources: Vec::new(),
+            })
+            .await
+            .expect_err("blank title should be rejected");
+
+        assert!(matches!(error, crate::error::AppError::Validation(_)));
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_blank_queries_and_messages() {
+        let temp_dir = env::temp_dir().join(format!("agentos-validation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let runtime = AgentRuntime::new(test_config(temp_dir.to_string_lossy().to_string()))
+            .await
+            .expect("create runtime");
+
+        let session = runtime
+            .create_session(CreateSessionRequest {
+                title: "test".to_string(),
+                working_dir: "/root/space".to_string(),
+            })
+            .await
+            .expect("create session");
+
+        assert!(matches!(
+            runtime
+                .append_message(
+                    session.id,
+                    AppendMessageRequest {
+                        role: MessageRole::User,
+                        content: "   ".to_string(),
+                    },
+                )
+                .await
+                .expect_err("blank message should fail"),
+            crate::error::AppError::Validation(_)
+        ));
+
+        assert!(matches!(
+            runtime
+                .search_sessions(SearchSessionRequest {
+                    query: " ".to_string(),
+                    limit: Some(3),
+                })
+                .await
+                .expect_err("blank session query should fail"),
+            crate::error::AppError::Validation(_)
+        ));
+
+        assert!(matches!(
+            runtime
+                .search_memories(SearchMemoryRequest {
+                    query: "".to_string(),
+                })
+                .await
+                .expect_err("blank memory query should fail"),
+            crate::error::AppError::Validation(_)
+        ));
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn validation_rejects_blank_memory_and_model_capability() {
+        let temp_dir = env::temp_dir().join(format!("agentos-validation-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let runtime = AgentRuntime::new(test_config(temp_dir.to_string_lossy().to_string()))
+            .await
+            .expect("create runtime");
+
+        assert!(matches!(
+            runtime
+                .create_memory(CreateMemoryRequest {
+                    scope: MemoryScope::LongTerm,
+                    title: "".to_string(),
+                    content: "hello".to_string(),
+                    tags: vec![],
+                })
+                .await
+                .expect_err("blank memory title should fail"),
+            crate::error::AppError::Validation(_)
+        ));
+
+        assert!(matches!(
+            runtime
+                .route_model(RouteModelRequest {
+                    capability: "   ".to_string(),
+                    prefer_local: true,
+                })
+                .await
+                .expect_err("blank capability should fail"),
+            crate::error::AppError::Validation(_)
+        ));
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }

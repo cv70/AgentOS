@@ -70,6 +70,20 @@ type ExecutionRecord = {
   audit_log: string[]
 }
 
+type SchedulerStatus = {
+  max_concurrent_tasks: number
+  running_task_ids: string[]
+  queued_task_ids: string[]
+  available_slots: number
+}
+
+type ApiErrorEnvelope = {
+  error?: {
+    kind: string
+    message: string
+  }
+}
+
 type SkillCandidate = {
   id: string
   title: string
@@ -269,8 +283,32 @@ const initialMemoryForm = {
 
 const initialHermesPrompt = '请复刻 hermes-agent，并给我一个适合在 AgentOS 中落地的实现方案。'
 
+async function readApiError(response: Response) {
+  const text = await response.text()
+
+  try {
+    const parsed: ApiErrorEnvelope = JSON.parse(text)
+    if (parsed.error?.message) {
+      return `[${parsed.error.kind}] ${parsed.error.message}`
+    }
+  } catch {
+    // Ignore JSON parse failures and use the raw response body instead.
+  }
+
+  return text || `${response.status} ${response.statusText}`
+}
+
+async function requestJson<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
+  const response = await fetch(input, init)
+  if (!response.ok) {
+    throw new Error(await readApiError(response))
+  }
+  return response.json() as Promise<T>
+}
+
 function App() {
   const [overview, setOverview] = useState<Overview | null>(null)
+  const [schedulerStatus, setSchedulerStatus] = useState<SchedulerStatus | null>(null)
   const [tools, setTools] = useState<{ tools: Tool[]; skills: Skill[] }>({ tools: [], skills: [] })
   const [tasks, setTasks] = useState<Task[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
@@ -278,6 +316,8 @@ function App() {
   const [workspaceContexts, setWorkspaceContexts] = useState<WorkspaceContextFile[]>([])
   const [selectedTaskId, setSelectedTaskId] = useState<string>('')
   const [executions, setExecutions] = useState<ExecutionRecord[]>([])
+  const [selectedExecutionId, setSelectedExecutionId] = useState<string>('')
+  const [selectedExecution, setSelectedExecution] = useState<ExecutionRecord | null>(null)
   const [learningReports, setLearningReports] = useState<TaskLearningReport[]>([])
   const [learningSummary, setLearningSummary] = useState<LearningSummary | null>(null)
   const [strategyTimeline, setStrategyTimeline] = useState<StrategyTimeline | null>(null)
@@ -303,45 +343,38 @@ function App() {
   const [hermesSessionId, setHermesSessionId] = useState<string>('')
   const [hermesMessage, setHermesMessage] = useState('')
   const [hermesResult, setHermesResult] = useState<HermesAgentResponse | null>(null)
+  const [dashboardError, setDashboardError] = useState('')
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
 
   const refreshDashboard = async (preserveTaskId?: string) => {
-    const [overviewRes, toolsRes, tasksRes, sessionsRes, memoriesRes, contextsRes, learningSummaryRes, strategyTimelineRes] = await Promise.all([
-      fetch('/api/v1/overview'),
-      fetch('/api/v1/tools'),
-      fetch('/api/v1/tasks'),
-      fetch('/api/v1/sessions'),
-      fetch('/api/v1/memories'),
-      fetch('/api/v1/contexts', {
+    setDashboardError('')
+    const [overviewJson, schedulerJson, toolsJson, tasksJson, sessionsJson, memoriesJson, contextsJson, learningSummaryJson, strategyTimelineJson] = await Promise.all([
+      requestJson<Overview>('/api/v1/overview'),
+      requestJson<SchedulerStatus>('/api/v1/scheduler'),
+      requestJson<{ tools: Tool[]; skills: Skill[] }>('/api/v1/tools'),
+      requestJson<Task[]>('/api/v1/tasks'),
+      requestJson<Session[]>('/api/v1/sessions'),
+      requestJson<Memory[]>('/api/v1/memories'),
+      requestJson<WorkspaceContextFile[]>('/api/v1/contexts', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ working_dir: '/root/space' }),
       }),
-      fetch('/api/v1/learning/summary', {
+      requestJson<LearningSummary>('/api/v1/learning/summary', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ working_dir: '/root/space' }),
       }),
-      fetch('/api/v1/learning/timeline', {
+      requestJson<StrategyTimeline>('/api/v1/learning/timeline', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ working_dir: '/root/space', limit: 12 }),
       }),
     ])
 
-    const [overviewJson, toolsJson, tasksJson, sessionsJson, memoriesJson, contextsJson, learningSummaryJson, strategyTimelineJson] = await Promise.all([
-      overviewRes.json(),
-      toolsRes.json(),
-      tasksRes.json(),
-      sessionsRes.json(),
-      memoriesRes.json(),
-      contextsRes.json(),
-      learningSummaryRes.json(),
-      strategyTimelineRes.json(),
-    ])
-
     setOverview(overviewJson)
+    setSchedulerStatus(schedulerJson)
     setTools(toolsJson)
     setTasks(tasksJson)
     setSessions(sessionsJson)
@@ -353,15 +386,21 @@ function App() {
     const nextTaskId = preserveTaskId || selectedTaskId || tasksJson[0]?.id || ''
     if (nextTaskId) {
       setSelectedTaskId(nextTaskId)
-      const executionRes = await fetch(`/api/v1/tasks/${nextTaskId}/executions`)
-      if (executionRes.ok) {
-        const executionJson: TaskExecutionInsights = await executionRes.json()
-        setExecutions(executionJson.executions)
-        setLearningReports(executionJson.learning_reports)
+      const executionJson = await requestJson<TaskExecutionInsights>(`/api/v1/tasks/${nextTaskId}/executions`)
+      setExecutions(executionJson.executions)
+      setLearningReports(executionJson.learning_reports)
+      const nextExecutionId = selectedExecutionId || executionJson.executions[0]?.id || ''
+      setSelectedExecutionId(nextExecutionId)
+      if (nextExecutionId) {
+        setSelectedExecution(await requestJson<ExecutionRecord>(`/api/v1/executions/${nextExecutionId}`))
+      } else {
+        setSelectedExecution(null)
       }
     } else {
       setExecutions([])
       setLearningReports([])
+      setSelectedExecutionId('')
+      setSelectedExecution(null)
     }
   }
 
@@ -369,6 +408,7 @@ function App() {
     refreshDashboard()
       .catch((error) => {
         console.error('failed to load dashboard', error)
+        setDashboardError(`初始化失败: ${String(error)}`)
       })
       .finally(() => setLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -379,14 +419,35 @@ function App() {
       return
     }
 
-    fetch(`/api/v1/tasks/${selectedTaskId}/executions`)
-      .then((response) => response.json())
+    requestJson<TaskExecutionInsights>(`/api/v1/tasks/${selectedTaskId}/executions`)
       .then((data: TaskExecutionInsights) => {
         setExecutions(data.executions)
         setLearningReports(data.learning_reports)
+        const nextExecutionId = data.executions[0]?.id || ''
+        setSelectedExecutionId(nextExecutionId)
+        if (!nextExecutionId) {
+          setSelectedExecution(null)
+        }
       })
-      .catch((error) => console.error('failed to load executions', error))
+      .catch((error) => {
+        console.error('failed to load executions', error)
+        setRunMessage(`执行记录加载失败: ${String(error)}`)
+      })
   }, [selectedTaskId])
+
+  useEffect(() => {
+    if (!selectedExecutionId) {
+      setSelectedExecution(null)
+      return
+    }
+
+    requestJson<ExecutionRecord>(`/api/v1/executions/${selectedExecutionId}`)
+      .then((data) => setSelectedExecution(data))
+      .catch((error) => {
+        console.error('failed to load execution detail', error)
+        setRunMessage(`执行详情加载失败: ${String(error)}`)
+      })
+  }, [selectedExecutionId])
 
   useEffect(() => {
     if (selectedSkillId || tools.skills.length === 0) {
@@ -416,6 +477,20 @@ function App() {
 
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null
   const selectedSkill = tools.skills.find((skill) => skill.id === selectedSkillId) ?? null
+  const queuedTasks = useMemo(
+    () =>
+      (schedulerStatus?.queued_task_ids ?? [])
+        .map((id) => tasks.find((task) => task.id === id))
+        .filter(Boolean) as Task[],
+    [schedulerStatus, tasks],
+  )
+  const runningTasks = useMemo(
+    () =>
+      (schedulerStatus?.running_task_ids ?? [])
+        .map((id) => tasks.find((task) => task.id === id))
+        .filter(Boolean) as Task[],
+    [schedulerStatus, tasks],
+  )
 
   const handleCreateTask = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -423,7 +498,7 @@ function App() {
     setTaskMessage('')
 
     try {
-      const response = await fetch('/api/v1/tasks', {
+      const task = await requestJson<Task>('/api/v1/tasks', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -438,12 +513,6 @@ function App() {
           working_dir: taskForm.working_dir,
         }),
       })
-
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-
-      const task: Task = await response.json()
       setTaskMessage(`任务 ${task.title} 已创建`)
       setSelectedTaskId(task.id)
       await refreshDashboard(task.id)
@@ -459,12 +528,7 @@ function App() {
     setRunMessage('')
 
     try {
-      const response = await fetch(`/api/v1/tasks/${taskId}/run`, { method: 'POST' })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-
-      const receipt: TaskReceipt = await response.json()
+      const receipt = await requestJson<TaskReceipt>(`/api/v1/tasks/${taskId}/run`, { method: 'POST' })
       setRunMessage(`执行已提交: ${receipt.message}`)
       await refreshDashboard(taskId)
     } catch (error) {
@@ -479,12 +543,7 @@ function App() {
     setRunMessage('')
 
     try {
-      const response = await fetch(`/api/v1/tasks/${taskId}/cancel`, { method: 'POST' })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-
-      const receipt: TaskReceipt = await response.json()
+      const receipt = await requestJson<TaskReceipt>(`/api/v1/tasks/${taskId}/cancel`, { method: 'POST' })
       setRunMessage(`取消请求已发送: ${receipt.message}`)
       await refreshDashboard(taskId)
     } catch (error) {
@@ -500,7 +559,7 @@ function App() {
     setMemoryMessage('')
 
     try {
-      const response = await fetch('/api/v1/memories', {
+      const memory = await requestJson<Memory>('/api/v1/memories', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -513,12 +572,6 @@ function App() {
             .filter(Boolean),
         }),
       })
-
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-
-      const memory: Memory = await response.json()
       setMemoryMessage(`已写入记忆: ${memory.title}`)
       await refreshDashboard(selectedTaskId)
     } catch (error) {
@@ -534,15 +587,11 @@ function App() {
     setSessionMessage('')
 
     try {
-      const response = await fetch('/api/v1/sessions/search', {
+      const results = await requestJson<SessionSearchResult[]>('/api/v1/sessions/search', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ query: sessionQuery, limit: 6 }),
       })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-      const results: SessionSearchResult[] = await response.json()
       setSessionResults(results)
       setSessionMessage(results.length === 0 ? '没有命中会话消息。' : `命中 ${results.length} 条会话消息`)
     } catch (error) {
@@ -558,15 +607,11 @@ function App() {
     setRouteMessage('')
 
     try {
-      const response = await fetch('/api/v1/models/route', {
+      const decision = await requestJson<ModelRouteDecision>('/api/v1/models/route', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ capability: routeCapability, prefer_local: preferLocal }),
       })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-      const decision: ModelRouteDecision = await response.json()
       setRouteDecision(decision)
       setRouteMessage(`已为 ${routeCapability} 能力完成路由`) 
     } catch (error) {
@@ -581,14 +626,11 @@ function App() {
     setRouteMessage('')
 
     try {
-      const response = await fetch('/api/v1/models/default', {
+      await requestJson<Model[]>('/api/v1/models/default', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ model_id: modelId }),
       })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
       setRouteMessage(`默认模型已切换为 ${modelId}`)
       await refreshDashboard(selectedTaskId)
     } catch (error) {
@@ -609,7 +651,7 @@ function App() {
     setSkillMessage('')
 
     try {
-      const response = await fetch(`/api/v1/skills/${encodeURIComponent(selectedSkillId)}/run`, {
+      const result = await requestJson<SkillExecutionResult>(`/api/v1/skills/${encodeURIComponent(selectedSkillId)}/run`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -619,10 +661,6 @@ function App() {
           working_dir: '/root/space',
         }),
       })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-      const result: SkillExecutionResult = await response.json()
       setSkillResult(result)
       setSkillMessage(`Skill ${result.skill.id} 已执行`)
       setSelectedTaskId(result.task.id)
@@ -645,7 +683,7 @@ function App() {
     setHermesMessage('')
 
     try {
-      const response = await fetch('/api/v1/agent/hermes/chat', {
+      const result = await requestJson<HermesAgentResponse>('/api/v1/agent/hermes/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -656,11 +694,6 @@ function App() {
           auto_persist_memory: true,
         }),
       })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-
-      const result: HermesAgentResponse = await response.json()
       setHermesResult(result)
       setHermesSessionId(result.session.id)
       setHermesMessage(`Hermes loop 已完成，使用模型 ${result.routed_model.selected.id}`)
@@ -677,7 +710,7 @@ function App() {
     setLearningMessage('')
 
     try {
-      const response = await fetch('/api/v1/skills/promote', {
+      const result = await requestJson<PromotedSkillResult>('/api/v1/skills/promote', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -687,11 +720,6 @@ function App() {
           working_dir: '/root/space',
         }),
       })
-      if (!response.ok) {
-        throw new Error(await response.text())
-      }
-
-      const result: PromotedSkillResult = await response.json()
       setLearningMessage(`已晋升 Skill ${result.skill.id}`)
       await refreshDashboard(selectedTaskId)
     } catch (error) {
@@ -707,6 +735,24 @@ function App() {
 
   return (
     <main className="app-shell">
+      {dashboardError ? (
+        <section className="alert-banner" role="alert">
+          <strong>Dashboard Error</strong>
+          <span>{dashboardError}</span>
+          <button
+            className="secondary-button"
+            onClick={() =>
+              refreshDashboard(selectedTaskId).catch((error) =>
+                setDashboardError(`刷新失败: ${String(error)}`),
+              )
+            }
+            type="button"
+          >
+            重试
+          </button>
+        </section>
+      ) : null}
+
       <section className="hero-panel">
         <div className="hero-copy">
           <span className="eyebrow">Single-node agent kernel</span>
@@ -742,16 +788,38 @@ function App() {
           <div className="lane-grid">
             <div className="lane-card accent-red">
               <h3>Scheduler</h3>
-              <p>并发上限 {overview?.scheduler.max_concurrent_tasks}</p>
-              {tasks.slice(0, 4).map((task) => (
+              <p>
+                并发上限 {schedulerStatus?.max_concurrent_tasks ?? overview?.scheduler.max_concurrent_tasks ?? 0}
+                {' / '}
+                剩余槽位 {schedulerStatus?.available_slots ?? 0}
+              </p>
+              {runningTasks.length === 0 ? (
+                <div className="line-item">
+                  <strong>无运行中任务</strong>
+                  <span>当前可以直接起跑新的任务</span>
+                </div>
+              ) : (
+                runningTasks.map((task) => (
+                  <button
+                    key={task.id}
+                    className={`line-item action-line${selectedTaskId === task.id ? ' selected' : ''}`}
+                    onClick={() => setSelectedTaskId(task.id)}
+                    type="button"
+                  >
+                    <strong>{task.title}</strong>
+                    <span>RUNNING / {task.priority}</span>
+                  </button>
+                ))
+              )}
+              {queuedTasks.slice(0, 3).map((task) => (
                 <button
                   key={task.id}
-                  className={`line-item action-line${selectedTaskId === task.id ? ' selected' : ''}`}
+                  className={`line-item action-line queue-item${selectedTaskId === task.id ? ' selected' : ''}`}
                   onClick={() => setSelectedTaskId(task.id)}
                   type="button"
                 >
                   <strong>{task.title}</strong>
-                  <span>{task.status} / {task.priority}</span>
+                  <span>QUEUED / {task.priority}</span>
                 </button>
               ))}
             </div>
@@ -854,7 +922,7 @@ function App() {
                 <>
                   <div className="selected-task-card">
                     <strong>{selectedTask.title}</strong>
-                    <span>{selectedTask.command.program} {selectedTask.command.args.join(' ')}</span>
+                    <span>{selectedTask.status} · {selectedTask.command.program} {selectedTask.command.args.join(' ')}</span>
                     <small>{selectedTask.working_dir}</small>
                     {selectedTask.strategy_sources.length > 0 ? (
                       <small>strategy: {selectedTask.strategy_sources.join(' / ')}</small>
@@ -884,15 +952,39 @@ function App() {
                   <p className="muted-copy">暂无执行记录</p>
                 ) : (
                   executions.slice(0, 3).map((item) => (
-                    <article key={item.id} className="execution-card">
+                    <button
+                      key={item.id}
+                      className={`execution-card action-line${selectedExecutionId === item.id ? ' selected' : ''}`}
+                      onClick={() => setSelectedExecutionId(item.id)}
+                      type="button"
+                    >
                       <div className="execution-meta">
                         <strong>{item.status}</strong>
                         <span>{item.duration_ms} ms / exit {String(item.exit_code)}</span>
                       </div>
                       <code>{item.command_line}</code>
                       <pre>{item.stdout || item.stderr || 'no output'}</pre>
-                    </article>
+                    </button>
                   ))
+                )}
+              </div>
+              <div className="execution-list">
+                {selectedExecution ? (
+                  <article className="execution-card detail-card">
+                    <div className="execution-meta">
+                      <strong>execution {selectedExecution.id.slice(0, 8)}</strong>
+                      <span>{selectedExecution.working_dir}</span>
+                    </div>
+                    <code>{selectedExecution.command_line}</code>
+                    <pre>{selectedExecution.stdout || selectedExecution.stderr || 'no output'}</pre>
+                    <div className="audit-trail">
+                      {selectedExecution.audit_log.map((line) => (
+                        <small key={line}>{line}</small>
+                      ))}
+                    </div>
+                  </article>
+                ) : (
+                  <p className="muted-copy">选择一条 execution，可查看完整 audit log。</p>
                 )}
               </div>
               <div className="execution-list">

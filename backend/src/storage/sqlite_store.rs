@@ -249,6 +249,32 @@ impl SqliteStore {
         .map_err(|error| AppError::Storage(format!("join insert execution task: {error}")))?
     }
 
+    pub async fn get_task_execution(
+        &self,
+        execution_id: Uuid,
+    ) -> AppResult<Option<TaskExecutionRecord>> {
+        let conn = self.conn.clone();
+        task::spawn_blocking(move || -> AppResult<Option<TaskExecutionRecord>> {
+            let guard = conn
+                .lock()
+                .map_err(|_| AppError::Storage("sqlite connection mutex poisoned".to_string()))?;
+            let payload = guard
+                .query_row(
+                    "SELECT payload FROM task_executions WHERE id = ?1",
+                    [execution_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| AppError::Storage(format!("get task execution: {error}")))?;
+            payload
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()
+                .map_err(AppError::from)
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join get task execution task: {error}")))?
+    }
+
     pub async fn list_task_learning_reports(
         &self,
         task_id: Uuid,

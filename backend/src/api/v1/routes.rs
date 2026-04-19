@@ -23,6 +23,7 @@ pub fn routes() -> Router<AppState> {
             "/tasks/:task_id/executions",
             get(handlers::list_task_executions),
         )
+        .route("/executions/:execution_id", get(handlers::get_execution))
         .route(
             "/sessions",
             get(handlers::list_sessions).post(handlers::create_session),
@@ -47,4 +48,5 @@ pub fn routes() -> Router<AppState> {
         .route("/models", get(handlers::list_models))
         .route("/models/route", post(handlers::route_model))
         .route("/models/default", post(handlers::set_default_model))
+        .route("/scheduler", get(handlers::get_scheduler))
 }

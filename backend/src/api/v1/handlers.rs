@@ -2,6 +2,7 @@ use axum::{
     Json,
     extract::{Path, State},
     http::StatusCode,
+    response::IntoResponse,
 };
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ use crate::state::AppState;
 
 pub async fn get_overview(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .overview()
@@ -30,7 +31,7 @@ pub async fn get_overview(
 
 pub async fn list_tasks(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .list_tasks()
@@ -42,7 +43,7 @@ pub async fn list_tasks(
 pub async fn create_task(
     State(state): State<AppState>,
     Json(payload): Json<CreateTaskRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
     state
         .runtime
         .create_task(payload)
@@ -54,7 +55,7 @@ pub async fn create_task(
 pub async fn run_task(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .run_task(task_id)
@@ -66,7 +67,7 @@ pub async fn run_task(
 pub async fn cancel_task(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .cancel_task(task_id)
@@ -78,7 +79,7 @@ pub async fn cancel_task(
 pub async fn list_task_executions(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .task_execution_insights(task_id)
@@ -87,11 +88,23 @@ pub async fn list_task_executions(
         .map_err(internal_error)
 }
 
+pub async fn get_execution(
+    State(state): State<AppState>,
+    Path(execution_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    state
+        .runtime
+        .get_execution(execution_id)
+        .await
+        .map(|item| Json(serde_json::json!(item)))
+        .map_err(internal_error)
+}
+
 pub async fn update_task_status(
     State(state): State<AppState>,
     Path(task_id): Path<Uuid>,
     Json(payload): Json<UpdateTaskStatusRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .update_task_status(task_id, payload)
@@ -102,7 +115,7 @@ pub async fn update_task_status(
 
 pub async fn list_sessions(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .list_sessions()
@@ -114,7 +127,7 @@ pub async fn list_sessions(
 pub async fn create_session(
     State(state): State<AppState>,
     Json(payload): Json<CreateSessionRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
     state
         .runtime
         .create_session(payload)
@@ -127,7 +140,7 @@ pub async fn append_message(
     State(state): State<AppState>,
     Path(session_id): Path<Uuid>,
     Json(payload): Json<AppendMessageRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .append_message(session_id, payload)
@@ -138,7 +151,7 @@ pub async fn append_message(
 
 pub async fn list_memories(
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .list_memories()
@@ -150,7 +163,7 @@ pub async fn list_memories(
 pub async fn create_memory(
     State(state): State<AppState>,
     Json(payload): Json<CreateMemoryRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), axum::response::Response> {
     state
         .runtime
         .create_memory(payload)
@@ -162,7 +175,7 @@ pub async fn create_memory(
 pub async fn search_memories(
     State(state): State<AppState>,
     Json(payload): Json<SearchMemoryRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .search_memories(payload)
@@ -181,7 +194,7 @@ pub async fn list_tools(State(state): State<AppState>) -> Json<serde_json::Value
 pub async fn list_workspace_contexts(
     State(state): State<AppState>,
     Json(payload): Json<ListWorkspaceContextsRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .list_workspace_contexts(payload.working_dir)
@@ -193,7 +206,7 @@ pub async fn list_workspace_contexts(
 pub async fn get_learning_summary(
     State(state): State<AppState>,
     Json(payload): Json<ListLearningSummaryRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .learning_summary(payload.working_dir)
@@ -205,7 +218,7 @@ pub async fn get_learning_summary(
 pub async fn get_strategy_timeline(
     State(state): State<AppState>,
     Json(payload): Json<ListStrategyTimelineRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .strategy_timeline(payload.working_dir, payload.limit)
@@ -217,7 +230,7 @@ pub async fn get_strategy_timeline(
 pub async fn hermes_chat(
     State(state): State<AppState>,
     Json(payload): Json<HermesAgentRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .hermes_chat(payload)
@@ -230,7 +243,7 @@ pub async fn run_skill(
     State(state): State<AppState>,
     Path(skill_id): Path<String>,
     Json(payload): Json<RunSkillRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .run_skill(&skill_id, payload)
@@ -242,7 +255,7 @@ pub async fn run_skill(
 pub async fn promote_skill_candidate(
     State(state): State<AppState>,
     Json(payload): Json<PromoteSkillCandidateRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .promote_skill_candidate(payload)
@@ -258,7 +271,7 @@ pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Valu
 pub async fn route_model(
     State(state): State<AppState>,
     Json(payload): Json<RouteModelRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .route_model(payload)
@@ -270,7 +283,7 @@ pub async fn route_model(
 pub async fn set_default_model(
     State(state): State<AppState>,
     Json(payload): Json<SetDefaultModelRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .set_default_model(payload)
@@ -282,7 +295,7 @@ pub async fn set_default_model(
 pub async fn search_sessions(
     State(state): State<AppState>,
     Json(payload): Json<crate::domain::session::SearchSessionRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
     state
         .runtime
         .search_sessions(payload)
@@ -291,10 +304,22 @@ pub async fn search_sessions(
         .map_err(internal_error)
 }
 
-fn internal_error(error: crate::error::AppError) -> (StatusCode, String) {
-    let status = match error {
-        crate::error::AppError::NotFound(_) => StatusCode::NOT_FOUND,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, error.to_string())
+pub async fn get_scheduler(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, axum::response::Response> {
+    state
+        .runtime
+        .scheduler_status()
+        .await
+        .map(|status| Json(serde_json::json!(status)))
+        .map_err(internal_error)
+}
+
+fn internal_error(error: crate::error::AppError) -> axum::response::Response {
+    let status = error.status_code();
+    (
+        status,
+        Json(serde_json::to_value(error.envelope()).expect("serialize error")),
+    )
+        .into_response()
 }
