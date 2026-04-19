@@ -47,6 +47,23 @@ pub struct AppendMessageRequest {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchSessionRequest {
+    pub query: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionSearchResult {
+    pub session_id: Uuid,
+    pub title: String,
+    pub working_dir: String,
+    pub role: MessageRole,
+    pub excerpt: String,
+    pub score: f32,
+    pub created_at: DateTime<Utc>,
+}
+
 impl AgentSession {
     pub fn new(input: CreateSessionRequest) -> Self {
         let now = Utc::now();

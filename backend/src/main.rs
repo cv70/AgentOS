@@ -39,6 +39,8 @@ async fn main() -> AppResult<()> {
     let addr = format!("{}:{}", config.server.host, config.server.port);
     info!("AgentOS backend listening on {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await.map_err(anyhow::Error::from)?;
+    axum::serve(listener, app)
+        .await
+        .map_err(anyhow::Error::from)?;
     Ok(())
 }

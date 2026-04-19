@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::domain::learning::TaskLearningReport;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TaskPriority {
@@ -56,6 +58,8 @@ pub struct AgentTask {
     pub command: TaskCommand,
     pub working_dir: String,
     #[serde(default)]
+    pub strategy_sources: Vec<String>,
+    #[serde(default)]
     pub last_exit_code: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -79,6 +83,13 @@ pub struct TaskExecutionRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TaskExecutionInsights {
+    pub task_id: Uuid,
+    pub executions: Vec<TaskExecutionRecord>,
+    pub learning_reports: Vec<TaskLearningReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TaskRunReceipt {
     pub task_id: Uuid,
     pub status: TaskStatus,
@@ -93,6 +104,8 @@ pub struct CreateTaskRequest {
     pub sandbox_profile: String,
     pub command: TaskCommand,
     pub working_dir: String,
+    #[serde(default)]
+    pub strategy_sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +144,7 @@ impl AgentTask {
             resources,
             command: input.command,
             working_dir: input.working_dir,
+            strategy_sources: input.strategy_sources,
             last_exit_code: None,
             created_at: now,
             updated_at: now,

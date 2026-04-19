@@ -6,13 +6,20 @@ use axum::{
 use uuid::Uuid;
 
 use crate::domain::{
+    agent::HermesAgentRequest,
+    context::{ListLearningSummaryRequest, ListWorkspaceContextsRequest},
+    learning::ListStrategyTimelineRequest,
     memory::{CreateMemoryRequest, SearchMemoryRequest},
+    model::{RouteModelRequest, SetDefaultModelRequest},
     session::{AppendMessageRequest, CreateSessionRequest},
     task::{CreateTaskRequest, UpdateTaskStatusRequest},
+    tool::{PromoteSkillCandidateRequest, RunSkillRequest},
 };
 use crate::state::AppState;
 
-pub async fn get_overview(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+pub async fn get_overview(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .runtime
         .overview()
@@ -21,7 +28,9 @@ pub async fn get_overview(State(state): State<AppState>) -> Result<Json<serde_js
         .map_err(internal_error)
 }
 
-pub async fn list_tasks(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+pub async fn list_tasks(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .runtime
         .list_tasks()
@@ -72,7 +81,7 @@ pub async fn list_task_executions(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .runtime
-        .list_task_executions(task_id)
+        .task_execution_insights(task_id)
         .await
         .map(|items| Json(serde_json::json!(items)))
         .map_err(internal_error)
@@ -91,7 +100,9 @@ pub async fn update_task_status(
         .map_err(internal_error)
 }
 
-pub async fn list_sessions(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+pub async fn list_sessions(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .runtime
         .list_sessions()
@@ -125,7 +136,9 @@ pub async fn append_message(
         .map_err(internal_error)
 }
 
-pub async fn list_memories(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+pub async fn list_memories(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     state
         .runtime
         .list_memories()
@@ -165,8 +178,117 @@ pub async fn list_tools(State(state): State<AppState>) -> Json<serde_json::Value
     }))
 }
 
+pub async fn list_workspace_contexts(
+    State(state): State<AppState>,
+    Json(payload): Json<ListWorkspaceContextsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .list_workspace_contexts(payload.working_dir)
+        .await
+        .map(|items| Json(serde_json::json!(items)))
+        .map_err(internal_error)
+}
+
+pub async fn get_learning_summary(
+    State(state): State<AppState>,
+    Json(payload): Json<ListLearningSummaryRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .learning_summary(payload.working_dir)
+        .await
+        .map(|items| Json(serde_json::json!(items)))
+        .map_err(internal_error)
+}
+
+pub async fn get_strategy_timeline(
+    State(state): State<AppState>,
+    Json(payload): Json<ListStrategyTimelineRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .strategy_timeline(payload.working_dir, payload.limit)
+        .await
+        .map(|items| Json(serde_json::json!(items)))
+        .map_err(internal_error)
+}
+
+pub async fn hermes_chat(
+    State(state): State<AppState>,
+    Json(payload): Json<HermesAgentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .hermes_chat(payload)
+        .await
+        .map(|result| Json(serde_json::json!(result)))
+        .map_err(internal_error)
+}
+
+pub async fn run_skill(
+    State(state): State<AppState>,
+    Path(skill_id): Path<String>,
+    Json(payload): Json<RunSkillRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .run_skill(&skill_id, payload)
+        .await
+        .map(|result| Json(serde_json::json!(result)))
+        .map_err(internal_error)
+}
+
+pub async fn promote_skill_candidate(
+    State(state): State<AppState>,
+    Json(payload): Json<PromoteSkillCandidateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .promote_skill_candidate(payload)
+        .await
+        .map(|result| Json(serde_json::json!(result)))
+        .map_err(internal_error)
+}
+
 pub async fn list_models(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!(state.runtime.models()))
+    Json(serde_json::json!(state.runtime.models().await))
+}
+
+pub async fn route_model(
+    State(state): State<AppState>,
+    Json(payload): Json<RouteModelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .route_model(payload)
+        .await
+        .map(|decision| Json(serde_json::json!(decision)))
+        .map_err(internal_error)
+}
+
+pub async fn set_default_model(
+    State(state): State<AppState>,
+    Json(payload): Json<SetDefaultModelRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .set_default_model(payload)
+        .await
+        .map(|models| Json(serde_json::json!(models)))
+        .map_err(internal_error)
+}
+
+pub async fn search_sessions(
+    State(state): State<AppState>,
+    Json(payload): Json<crate::domain::session::SearchSessionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .runtime
+        .search_sessions(payload)
+        .await
+        .map(|results| Json(serde_json::json!(results)))
+        .map_err(internal_error)
 }
 
 fn internal_error(error: crate::error::AppError) -> (StatusCode, String) {

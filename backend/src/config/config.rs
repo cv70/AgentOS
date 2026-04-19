@@ -60,6 +60,10 @@ pub struct ModelProviderConfig {
     pub kind: String,
     pub endpoint: String,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub model_name: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 impl AppConfig {

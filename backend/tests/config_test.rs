@@ -10,8 +10,30 @@ fn load_default_config() {
     assert_eq!(config.runtime.max_concurrent_tasks, 3);
     assert_eq!(config.models.default_model, "local-phi4");
     assert_eq!(config.storage.state_file, "agentos.db");
-    assert!(config.sandbox.allowed_programs.iter().any(|item| item == "sh"));
+    assert_eq!(
+        config.models.providers[0].model_name.as_deref(),
+        Some("phi4")
+    );
+    assert!(
+        config
+            .sandbox
+            .allowed_programs
+            .iter()
+            .any(|item| item == "sh")
+    );
     assert_eq!(config.sandbox.max_output_bytes, 32768);
-    assert!(config.sandbox.profiles.iter().any(|profile| profile.id == "read-only"));
-    assert!(config.sandbox.profiles.iter().any(|profile| profile.id == "tmp-only"));
+    assert!(
+        config
+            .sandbox
+            .profiles
+            .iter()
+            .any(|profile| profile.id == "read-only")
+    );
+    assert!(
+        config
+            .sandbox
+            .profiles
+            .iter()
+            .any(|profile| profile.id == "tmp-only")
+    );
 }

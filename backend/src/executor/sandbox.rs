@@ -30,7 +30,10 @@ impl SandboxExecutor {
     pub async fn register_run(&self, task_id: Uuid) -> AppResult<oneshot::Receiver<()>> {
         let mut registry = self.cancellations.lock().await;
         if registry.contains_key(&task_id) {
-            return Err(AppError::Runtime(format!("task {} is already running", task_id)));
+            return Err(AppError::Runtime(format!(
+                "task {} is already running",
+                task_id
+            )));
         }
         let (tx, rx) = oneshot::channel();
         registry.insert(task_id, tx);
@@ -48,16 +51,26 @@ impl SandboxExecutor {
                 let _ = tx.send(());
                 Ok(())
             }
-            None => Err(AppError::Runtime(format!("task {} is not running", task_id))),
+            None => Err(AppError::Runtime(format!(
+                "task {} is not running",
+                task_id
+            ))),
         }
     }
 
-    pub async fn run_task(&self, task: &AgentTask, cancel_rx: oneshot::Receiver<()>) -> AppResult<TaskExecutionRecord> {
+    pub async fn run_task(
+        &self,
+        task: &AgentTask,
+        cancel_rx: oneshot::Receiver<()>,
+    ) -> AppResult<TaskExecutionRecord> {
         let profile = self.validate_task(task)?;
         let working_dir = resolve_working_dir(&self.policy, profile, &task.working_dir)?;
         let started_at = Utc::now();
         let mut audit_log = vec![
-            format!("task={} entering sandbox profile={}", task.id, task.sandbox_profile),
+            format!(
+                "task={} entering sandbox profile={}",
+                task.id, task.sandbox_profile
+            ),
             format!("cwd={}", working_dir.display()),
             format!("allowed_program={}", task.command.program),
             format!("profile_writable={}", profile.writable),
@@ -89,7 +102,11 @@ impl SandboxExecutor {
             });
         }
         copy_allowed_env(&self.policy, &mut command, &mut audit_log);
-        audit_log.push(format!("exec={} {}", task.command.program, task.command.args.join(" ")));
+        audit_log.push(format!(
+            "exec={} {}",
+            task.command.program,
+            task.command.args.join(" ")
+        ));
 
         let mut child = command
             .spawn()
@@ -117,7 +134,13 @@ impl SandboxExecutor {
             data
         });
 
-        let status = wait_for_child(&mut child, cancel_rx, task.resources.timeout_secs, &mut audit_log).await?;
+        let status = wait_for_child(
+            &mut child,
+            cancel_rx,
+            task.resources.timeout_secs,
+            &mut audit_log,
+        )
+        .await?;
         let finished_at = Utc::now();
 
         let stdout_bytes = stdout_handle
@@ -229,7 +252,10 @@ fn terminate_child(child: &mut Child) {
     let _ = child.start_kill();
 }
 
-fn resolve_profile<'a>(policy: &'a SandboxConfig, profile_id: &str) -> AppResult<&'a SandboxProfileConfig> {
+fn resolve_profile<'a>(
+    policy: &'a SandboxConfig,
+    profile_id: &str,
+) -> AppResult<&'a SandboxProfileConfig> {
     policy
         .profiles
         .iter()
@@ -247,7 +273,9 @@ fn ensure_program_allowed(
     {
         Ok(())
     } else {
-        Err(AppError::Runtime(format!("program not allowed by sandbox policy: {program}")))
+        Err(AppError::Runtime(format!(
+            "program not allowed by sandbox policy: {program}"
+        )))
     }
 }
 
@@ -266,13 +294,25 @@ fn resolve_working_dir(
     };
 
     if !absolute.exists() {
-        return Err(AppError::Runtime(format!("working dir does not exist: {}", absolute.display())));
+        return Err(AppError::Runtime(format!(
+            "working dir does not exist: {}",
+            absolute.display()
+        )));
     }
     if !absolute.is_dir() {
-        return Err(AppError::Runtime(format!("working dir is not a directory: {}", absolute.display())));
+        return Err(AppError::Runtime(format!(
+            "working dir is not a directory: {}",
+            absolute.display()
+        )));
     }
-    if !policy.allowed_working_dirs.iter().any(|root| absolute.starts_with(root))
-        || !profile.allowed_working_dirs.iter().any(|root| absolute.starts_with(root))
+    if !policy
+        .allowed_working_dirs
+        .iter()
+        .any(|root| absolute.starts_with(root))
+        || !profile
+            .allowed_working_dirs
+            .iter()
+            .any(|root| absolute.starts_with(root))
     {
         return Err(AppError::Runtime(format!(
             "working dir not allowed by sandbox policy: {}",

@@ -9,8 +9,9 @@ use tokio::task;
 use uuid::Uuid;
 
 use crate::config::config::StorageConfig;
+use crate::domain::learning::{StrategyEvaluationEvent, TaskLearningReport};
 use crate::domain::memory::{MemoryEntry, MemorySearchResult};
-use crate::domain::session::AgentSession;
+use crate::domain::session::{AgentSession, MessageRole, SessionSearchResult};
 use crate::domain::task::{AgentTask, TaskExecutionRecord};
 use crate::error::{AppError, AppResult};
 
@@ -67,10 +68,31 @@ impl SqliteStore {
                         payload TEXT NOT NULL,
                         started_at TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS task_learning_reports (
+                        id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS strategy_evaluation_events (
+                        id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        strategy_source_key TEXT NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
                     CREATE TABLE IF NOT EXISTS sessions (
                         id TEXT PRIMARY KEY,
                         payload TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS session_messages (
+                        row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        message_id TEXT NOT NULL,
+                        session_id TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TEXT NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS memories (
                         id TEXT PRIMARY KEY,
@@ -84,11 +106,21 @@ impl SqliteStore {
                     );
                     CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_task_executions_task_id ON task_executions(task_id, started_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_task_learning_reports_task_id ON task_learning_reports(task_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_strategy_events_task_id ON strategy_evaluation_events(task_id, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_strategy_events_source_key ON strategy_evaluation_events(strategy_source_key, created_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_session_messages_session_id ON session_messages(session_id, created_at DESC);
                     CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at DESC);
                     "#,
                 )
                 .map_err(|error| AppError::Storage(format!("initialize sqlite schema: {error}")))?;
+            guard
+                .execute(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(content, role, session_id UNINDEXED, created_at UNINDEXED)",
+                    [],
+                )
+                .map_err(|error| AppError::Storage(format!("initialize session message fts: {error}")))?;
             Ok(())
         })
         .await
@@ -123,9 +155,15 @@ impl SqliteStore {
 
     pub async fn list_tasks(&self) -> AppResult<Vec<AgentTask>> {
         let conn = self.conn.clone();
-        task::spawn_blocking(move || query_payloads::<AgentTask>(&conn, "SELECT payload FROM tasks ORDER BY created_at DESC", "list tasks"))
-            .await
-            .map_err(|error| AppError::Storage(format!("join list tasks task: {error}")))?
+        task::spawn_blocking(move || {
+            query_payloads::<AgentTask>(
+                &conn,
+                "SELECT payload FROM tasks ORDER BY created_at DESC",
+                "list tasks",
+            )
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join list tasks task: {error}")))?
     }
 
     pub async fn upsert_task(&self, task_entry: AgentTask) -> AppResult<()> {
@@ -157,9 +195,11 @@ impl SqliteStore {
 
     pub async fn get_task(&self, task_id: Uuid) -> AppResult<Option<AgentTask>> {
         let conn = self.conn.clone();
-        task::spawn_blocking(move || query_payload_by_id::<AgentTask>(&conn, "tasks", task_id, "get task"))
-            .await
-            .map_err(|error| AppError::Storage(format!("join get task task: {error}")))?
+        task::spawn_blocking(move || {
+            query_payload_by_id::<AgentTask>(&conn, "tasks", task_id, "get task")
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join get task task: {error}")))?
     }
 
     pub async fn list_task_executions(&self, task_id: Uuid) -> AppResult<Vec<TaskExecutionRecord>> {
@@ -209,11 +249,150 @@ impl SqliteStore {
         .map_err(|error| AppError::Storage(format!("join insert execution task: {error}")))?
     }
 
+    pub async fn list_task_learning_reports(
+        &self,
+        task_id: Uuid,
+    ) -> AppResult<Vec<TaskLearningReport>> {
+        let conn = self.conn.clone();
+        task::spawn_blocking(move || -> AppResult<Vec<TaskLearningReport>> {
+            let guard = conn
+                .lock()
+                .map_err(|_| AppError::Storage("sqlite connection mutex poisoned".to_string()))?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT payload FROM task_learning_reports WHERE task_id = ?1 ORDER BY created_at DESC",
+                )
+                .map_err(|error| {
+                    AppError::Storage(format!("prepare list learning reports: {error}"))
+                })?;
+            let rows = stmt
+                .query_map([task_id.to_string()], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    AppError::Storage(format!("query list learning reports: {error}"))
+                })?;
+            let mut items = Vec::new();
+            for row in rows {
+                let payload =
+                    row.map_err(|error| AppError::Storage(format!("read learning row: {error}")))?;
+                items.push(serde_json::from_str(&payload)?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join list learning reports task: {error}")))?
+    }
+
+    pub async fn add_task_learning_report(&self, report: TaskLearningReport) -> AppResult<()> {
+        let conn = self.conn.clone();
+        task::spawn_blocking(move || -> AppResult<()> {
+            let payload = serde_json::to_string(&report)?;
+            let guard = conn
+                .lock()
+                .map_err(|_| AppError::Storage("sqlite connection mutex poisoned".to_string()))?;
+            guard
+                .execute(
+                    "INSERT INTO task_learning_reports (id, task_id, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        report.id.to_string(),
+                        report.task_id.to_string(),
+                        payload,
+                        report.created_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| AppError::Storage(format!("insert task learning report: {error}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join insert learning report task: {error}")))?
+    }
+
+    pub async fn list_all_task_learning_reports(&self) -> AppResult<Vec<TaskLearningReport>> {
+        let conn = self.conn.clone();
+        task::spawn_blocking(move || -> AppResult<Vec<TaskLearningReport>> {
+            query_payloads::<TaskLearningReport>(
+                &conn,
+                "SELECT payload FROM task_learning_reports ORDER BY created_at DESC",
+                "list all learning reports",
+            )
+        })
+        .await
+        .map_err(|error| {
+            AppError::Storage(format!("join list all learning reports task: {error}"))
+        })?
+    }
+
+    pub async fn add_strategy_evaluation_event(
+        &self,
+        event: StrategyEvaluationEvent,
+    ) -> AppResult<()> {
+        let conn = self.conn.clone();
+        task::spawn_blocking(move || -> AppResult<()> {
+            let payload = serde_json::to_string(&event)?;
+            let guard = conn
+                .lock()
+                .map_err(|_| AppError::Storage("sqlite connection mutex poisoned".to_string()))?;
+            guard
+                .execute(
+                    "INSERT INTO strategy_evaluation_events (id, task_id, strategy_source_key, payload, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        event.id.to_string(),
+                        event.task_id.to_string(),
+                        event.strategy_source_key,
+                        payload,
+                        event.created_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| AppError::Storage(format!("insert strategy event: {error}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join insert strategy event task: {error}")))?
+    }
+
+    pub async fn list_strategy_evaluation_events(
+        &self,
+        limit: usize,
+    ) -> AppResult<Vec<StrategyEvaluationEvent>> {
+        let conn = self.conn.clone();
+        task::spawn_blocking(move || -> AppResult<Vec<StrategyEvaluationEvent>> {
+            let guard = conn
+                .lock()
+                .map_err(|_| AppError::Storage("sqlite connection mutex poisoned".to_string()))?;
+            let mut stmt = guard
+                .prepare(
+                    "SELECT payload FROM strategy_evaluation_events ORDER BY created_at DESC LIMIT ?1",
+                )
+                .map_err(|error| {
+                    AppError::Storage(format!("prepare list strategy events: {error}"))
+                })?;
+            let rows = stmt
+                .query_map([limit as i64], |row| row.get::<_, String>(0))
+                .map_err(|error| {
+                    AppError::Storage(format!("query list strategy events: {error}"))
+                })?;
+            let mut items = Vec::new();
+            for row in rows {
+                let payload =
+                    row.map_err(|error| AppError::Storage(format!("read strategy row: {error}")))?;
+                items.push(serde_json::from_str(&payload)?);
+            }
+            Ok(items)
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join list strategy events task: {error}")))?
+    }
+
     pub async fn list_sessions(&self) -> AppResult<Vec<AgentSession>> {
         let conn = self.conn.clone();
-        task::spawn_blocking(move || query_payloads::<AgentSession>(&conn, "SELECT payload FROM sessions ORDER BY updated_at DESC", "list sessions"))
-            .await
-            .map_err(|error| AppError::Storage(format!("join list sessions task: {error}")))?
+        task::spawn_blocking(move || {
+            query_payloads::<AgentSession>(
+                &conn,
+                "SELECT payload FROM sessions ORDER BY updated_at DESC",
+                "list sessions",
+            )
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join list sessions task: {error}")))?
     }
 
     pub async fn upsert_session(&self, session_entry: AgentSession) -> AppResult<()> {
@@ -222,21 +401,70 @@ impl SqliteStore {
             let payload = serde_json::to_string(&session_entry)?;
             let id = session_entry.id.to_string();
             let updated_at = session_entry.updated_at.to_rfc3339();
-            let guard = conn
+            let mut guard = conn
                 .lock()
                 .map_err(|_| AppError::Storage("sqlite connection mutex poisoned".to_string()))?;
-            guard
-                .execute(
-                    r#"
+            let tx = guard.transaction().map_err(|error| {
+                AppError::Storage(format!("begin session transaction: {error}"))
+            })?;
+            tx.execute(
+                r#"
                     INSERT INTO sessions (id, payload, updated_at)
                     VALUES (?1, ?2, ?3)
                     ON CONFLICT(id) DO UPDATE SET
                         payload = excluded.payload,
                         updated_at = excluded.updated_at
                     "#,
-                    params![id, payload, updated_at],
+                params![id, payload, updated_at],
+            )
+            .map_err(|error| AppError::Storage(format!("upsert session: {error}")))?;
+            tx.execute(
+                "DELETE FROM session_messages WHERE session_id = ?1",
+                [session_entry.id.to_string()],
+            )
+            .map_err(|error| AppError::Storage(format!("clear session messages: {error}")))?;
+            tx.execute(
+                "DELETE FROM session_messages_fts WHERE session_id = ?1",
+                [session_entry.id.to_string()],
+            )
+            .map_err(|error| AppError::Storage(format!("clear session message fts: {error}")))?;
+
+            for message in &session_entry.messages {
+                let role = serde_json::to_string(&message.role)?;
+                tx.execute(
+                    r#"
+                    INSERT INTO session_messages (message_id, session_id, role, content, created_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    "#,
+                    params![
+                        message.id.to_string(),
+                        session_entry.id.to_string(),
+                        &role,
+                        &message.content,
+                        message.created_at.to_rfc3339(),
+                    ],
                 )
-                .map_err(|error| AppError::Storage(format!("upsert session: {error}")))?;
+                .map_err(|error| AppError::Storage(format!("insert session message: {error}")))?;
+                tx.execute(
+                    r#"
+                    INSERT INTO session_messages_fts (content, role, session_id, created_at)
+                    VALUES (?1, ?2, ?3, ?4)
+                    "#,
+                    params![
+                        &message.content,
+                        &role,
+                        session_entry.id.to_string(),
+                        message.created_at.to_rfc3339(),
+                    ],
+                )
+                .map_err(|error| {
+                    AppError::Storage(format!("insert session message fts row: {error}"))
+                })?;
+            }
+
+            tx.commit().map_err(|error| {
+                AppError::Storage(format!("commit session transaction: {error}"))
+            })?;
             Ok(())
         })
         .await
@@ -245,16 +473,137 @@ impl SqliteStore {
 
     pub async fn get_session(&self, session_id: Uuid) -> AppResult<Option<AgentSession>> {
         let conn = self.conn.clone();
-        task::spawn_blocking(move || query_payload_by_id::<AgentSession>(&conn, "sessions", session_id, "get session"))
-            .await
-            .map_err(|error| AppError::Storage(format!("join get session task: {error}")))?
+        task::spawn_blocking(move || {
+            query_payload_by_id::<AgentSession>(&conn, "sessions", session_id, "get session")
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join get session task: {error}")))?
+    }
+
+    pub async fn search_sessions(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> AppResult<Vec<SessionSearchResult>> {
+        let conn = self.conn.clone();
+        let query = query.trim().to_string();
+        task::spawn_blocking(move || -> AppResult<Vec<SessionSearchResult>> {
+            if query.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let guard = conn
+                .lock()
+                .map_err(|_| AppError::Storage("sqlite connection mutex poisoned".to_string()))?;
+            let mut results = Vec::new();
+
+            let fts_query = format!("\"{}\"", query.replace('\"', " "));
+            let mut stmt = guard
+                .prepare(
+                    r#"
+                    SELECT s.payload, sm.role, sm.content, sm.created_at, bm25(session_messages_fts) AS rank
+                    FROM session_messages_fts
+                    JOIN session_messages sm ON sm.row_id = session_messages_fts.rowid
+                    JOIN sessions s ON s.id = sm.session_id
+                    WHERE session_messages_fts MATCH ?1
+                    ORDER BY rank
+                    LIMIT ?2
+                    "#,
+                )
+                .map_err(|error| AppError::Storage(format!("prepare search sessions: {error}")))?;
+            let rows = stmt
+                .query_map(params![fts_query, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, f32>(4)?,
+                    ))
+                })
+                .map_err(|error| AppError::Storage(format!("query search sessions: {error}")))?;
+
+            for row in rows {
+                let (payload, role_json, content, created_at, rank) =
+                    row.map_err(|error| AppError::Storage(format!("read session search row: {error}")))?;
+                let session: AgentSession = serde_json::from_str(&payload)?;
+                let role: MessageRole = serde_json::from_str(&role_json)?;
+                results.push(SessionSearchResult {
+                    session_id: session.id,
+                    title: session.title,
+                    working_dir: session.working_dir,
+                    role,
+                    excerpt: build_excerpt(&content, &query),
+                    score: 1.0 / (1.0 + rank.abs()),
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .map_err(|error| AppError::Storage(format!("parse session message timestamp: {error}")))?
+                        .with_timezone(&chrono::Utc),
+                });
+            }
+
+            if !results.is_empty() {
+                return Ok(results);
+            }
+
+            let mut fallback_stmt = guard
+                .prepare(
+                    r#"
+                    SELECT s.payload, sm.role, sm.content, sm.created_at
+                    FROM session_messages sm
+                    JOIN sessions s ON s.id = sm.session_id
+                    WHERE sm.content LIKE ?1
+                    ORDER BY sm.created_at DESC
+                    LIMIT ?2
+                    "#,
+                )
+                .map_err(|error| AppError::Storage(format!("prepare fallback session search: {error}")))?;
+            let like_query = format!("%{}%", query);
+            let rows = fallback_stmt
+                .query_map(params![like_query, limit as i64], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|error| AppError::Storage(format!("query fallback session search: {error}")))?;
+
+            for row in rows {
+                let (payload, role_json, content, created_at) =
+                    row.map_err(|error| AppError::Storage(format!("read fallback session row: {error}")))?;
+                let session: AgentSession = serde_json::from_str(&payload)?;
+                let role: MessageRole = serde_json::from_str(&role_json)?;
+                results.push(SessionSearchResult {
+                    session_id: session.id,
+                    title: session.title,
+                    working_dir: session.working_dir,
+                    role,
+                    excerpt: build_excerpt(&content, &query),
+                    score: 0.5,
+                    created_at: chrono::DateTime::parse_from_rfc3339(&created_at)
+                        .map_err(|error| AppError::Storage(format!("parse fallback session timestamp: {error}")))?
+                        .with_timezone(&chrono::Utc),
+                });
+            }
+
+            Ok(results)
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join search sessions task: {error}")))?
     }
 
     pub async fn list_memories(&self) -> AppResult<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
-        task::spawn_blocking(move || query_payloads::<MemoryEntry>(&conn, "SELECT payload FROM memories ORDER BY created_at DESC", "list memories"))
-            .await
-            .map_err(|error| AppError::Storage(format!("join list memories task: {error}")))?
+        task::spawn_blocking(move || {
+            query_payloads::<MemoryEntry>(
+                &conn,
+                "SELECT payload FROM memories ORDER BY created_at DESC",
+                "list memories",
+            )
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("join list memories task: {error}")))?
     }
 
     pub async fn upsert_memory(&self, memory_entry: MemoryEntry) -> AppResult<()> {
@@ -299,7 +648,11 @@ impl SqliteStore {
         .map_err(|error| AppError::Storage(format!("join upsert memory task: {error}")))?
     }
 
-    pub async fn search_memories(&self, query: &str, limit: usize) -> AppResult<Vec<MemorySearchResult>> {
+    pub async fn search_memories(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> AppResult<Vec<MemorySearchResult>> {
         let conn = self.conn.clone();
         let query = query.to_string();
         task::spawn_blocking(move || -> AppResult<Vec<MemorySearchResult>> {
@@ -334,7 +687,8 @@ impl SqliteStore {
                     .iter()
                     .filter(|token| contains_token(&title, &content, &tags, token))
                     .count();
-                let score = cosine_similarity(&query_embedding, &embedding) + keyword_hits as f32 * 0.08;
+                let score =
+                    cosine_similarity(&query_embedding, &embedding) + keyword_hits as f32 * 0.08;
                 if score > 0.0 {
                     results.push(MemorySearchResult {
                         memory,
@@ -375,13 +729,19 @@ where
 
     let mut items = Vec::new();
     for row in rows {
-        let payload = row.map_err(|error| AppError::Storage(format!("read {label} row: {error}")))?;
+        let payload =
+            row.map_err(|error| AppError::Storage(format!("read {label} row: {error}")))?;
         items.push(serde_json::from_str(&payload)?);
     }
     Ok(items)
 }
 
-fn query_payload_by_id<T>(conn: &Arc<Mutex<Connection>>, table: &str, id: Uuid, label: &str) -> AppResult<Option<T>>
+fn query_payload_by_id<T>(
+    conn: &Arc<Mutex<Connection>>,
+    table: &str,
+    id: Uuid,
+    label: &str,
+) -> AppResult<Option<T>>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -393,7 +753,9 @@ where
         .query_row(&sql, [id.to_string()], |row| row.get(0))
         .optional()
         .map_err(|error| AppError::Storage(format!("{label}: {error}")))?;
-    payload.map(|raw| serde_json::from_str(&raw).map_err(AppError::from)).transpose()
+    payload
+        .map(|raw| serde_json::from_str(&raw).map_err(AppError::from))
+        .transpose()
 }
 
 fn tokenize(input: &str) -> Vec<String> {
@@ -413,7 +775,9 @@ fn embed_text(title: &str, content: &str, tags: &[String]) -> Vec<f32> {
     let mut vector = vec![0.0; EMBEDDING_DIM];
     let combined = format!("{title} {content} {}", tags.join(" "));
     for token in tokenize(&combined) {
-        let hash = token.bytes().fold(0_u64, |acc, byte| acc.wrapping_mul(131).wrapping_add(byte as u64));
+        let hash = token.bytes().fold(0_u64, |acc, byte| {
+            acc.wrapping_mul(131).wrapping_add(byte as u64)
+        });
         let index = (hash as usize) % EMBEDDING_DIM;
         vector[index] += 1.0;
     }
@@ -441,6 +805,32 @@ fn contains_token(title: &str, content: &str, tags: &[String], token: &str) -> b
         || tags.iter().any(|tag| tag.to_lowercase().contains(&token))
 }
 
+fn build_excerpt(content: &str, query: &str) -> String {
+    let normalized_content = content.trim();
+    if normalized_content.is_empty() {
+        return "empty message".to_string();
+    }
+
+    let content_chars: Vec<char> = normalized_content.chars().collect();
+    let lower_content = normalized_content.to_lowercase();
+    let lower_query = query.to_lowercase();
+
+    if let Some(index) = lower_content.find(&lower_query) {
+        let prefix_chars = lower_content[..index].chars().count();
+        let query_chars = lower_query.chars().count();
+        let start = prefix_chars.saturating_sub(32);
+        let end = (prefix_chars + query_chars + 48).min(content_chars.len());
+        let excerpt: String = content_chars[start..end].iter().collect();
+        if start > 0 || end < content_chars.len() {
+            format!("...{}...", excerpt)
+        } else {
+            excerpt
+        }
+    } else {
+        content_chars.into_iter().take(88).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -450,6 +840,9 @@ mod tests {
 
     use crate::config::config::StorageConfig;
     use crate::domain::memory::{CreateMemoryRequest, MemoryEntry, MemoryScope};
+    use crate::domain::session::{
+        AgentSession, AppendMessageRequest, CreateSessionRequest, MessageRole,
+    };
 
     use super::{SqliteStore, cosine_similarity, embed_text};
 
@@ -459,7 +852,9 @@ mod tests {
         let related_b = embed_text("rust runtime", "task scheduler", &["agent".into()]);
         let unrelated = embed_text("garden", "flower watering", &["plants".into()]);
 
-        assert!(cosine_similarity(&related_a, &related_b) > cosine_similarity(&related_a, &unrelated));
+        assert!(
+            cosine_similarity(&related_a, &related_b) > cosine_similarity(&related_a, &unrelated)
+        );
     }
 
     #[tokio::test]
@@ -500,6 +895,41 @@ mod tests {
 
         assert!(!results.is_empty());
         assert_eq!(results[0].memory.title, "用户偏好");
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[tokio::test]
+    async fn session_search_prefers_matching_messages() {
+        let temp_dir = env::temp_dir().join(format!("agentos-session-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let store = SqliteStore::new(&StorageConfig {
+            data_dir: temp_dir.to_string_lossy().to_string(),
+            state_file: "session-test.db".to_string(),
+        })
+        .await
+        .expect("create store");
+
+        let mut session = AgentSession::new(CreateSessionRequest {
+            title: "代码会话".to_string(),
+            working_dir: "/root/space".to_string(),
+        });
+        session.append_message(
+            AppendMessageRequest {
+                role: MessageRole::User,
+                content: "请帮我实现 session 搜索和技能发现".to_string(),
+            },
+            12,
+        );
+        store.upsert_session(session).await.expect("insert session");
+
+        let results = store
+            .search_sessions("技能发现", 5)
+            .await
+            .expect("search sessions");
+        assert!(!results.is_empty());
+        assert_eq!(results[0].title, "代码会话");
 
         fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }

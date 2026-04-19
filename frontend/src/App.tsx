@@ -9,6 +9,7 @@ type Task = {
   status: string
   sandbox_profile: string
   working_dir: string
+  strategy_sources: string[]
   last_exit_code: number | null
   command: {
     program: string
@@ -24,12 +25,30 @@ type Session = {
   summary: { compressed_context: string; pinned_decisions: string[] }
 }
 
+type SessionSearchResult = {
+  session_id: string
+  title: string
+  working_dir: string
+  role: string
+  excerpt: string
+  score: number
+  created_at: string
+}
+
 type Memory = {
   id: string
   title: string
   content: string
   scope: string
   tags: string[]
+}
+
+type WorkspaceContextFile = {
+  kind: string
+  path: string
+  title: string
+  excerpt: string
+  guidance: string[]
 }
 
 type TaskReceipt = {
@@ -51,6 +70,82 @@ type ExecutionRecord = {
   audit_log: string[]
 }
 
+type SkillCandidate = {
+  id: string
+  title: string
+  description: string
+  rationale: string
+  suggested_trigger: string
+}
+
+type TaskLearningReport = {
+  id: string
+  task_id: string
+  execution_id: string
+  status: string
+  source_strategy_keys: string[]
+  recap: string
+  lessons: string[]
+  memory_ids: string[]
+  session_id: string | null
+  skill_candidates: SkillCandidate[]
+  created_at: string
+}
+
+type LearningCluster = {
+  key: string
+  title: string
+  capability: string
+  report_count: number
+  source_usage_count: number
+  source_success_rate: number
+  success_rate: number
+  recency_score: number
+  strategic_weight: number
+  suppression_level: string
+  pruned_from_planning: boolean
+  common_lessons: string[]
+  example_tasks: string[]
+  recommended_commands: string[]
+  strategic_skill_candidates: SkillCandidate[]
+}
+
+type LearningSummary = {
+  generated_at: string
+  total_reports: number
+  clusters: LearningCluster[]
+}
+
+type StrategyEvaluationEvent = {
+  id: string
+  task_id: string
+  execution_id: string
+  strategy_source_key: string
+  event_kind: string
+  outcome_status: string
+  summary: string
+  evidence: string
+  created_at: string
+}
+
+type StrategyTimeline = {
+  generated_at: string
+  total_events: number
+  events: StrategyEvaluationEvent[]
+}
+
+type PromotedSkillResult = {
+  skill: Skill
+  files: string[]
+  source_task: Task
+}
+
+type TaskExecutionInsights = {
+  task_id: string
+  executions: ExecutionRecord[]
+  learning_reports: TaskLearningReport[]
+}
+
 type Tool = {
   id: string
   display_name: string
@@ -64,6 +159,13 @@ type Skill = {
   description: string
   trigger: string
   installed: boolean
+  source: string
+  path: string
+  scripts: Array<{
+    name: string
+    path: string
+    runner: string
+  }>
 }
 
 type Model = {
@@ -72,6 +174,61 @@ type Model = {
   endpoint: string
   capabilities: string[]
   is_default: boolean
+  routing_weight: number
+}
+
+type ModelRouteDecision = {
+  selected: Model
+  fallbacks: Model[]
+  reason: string
+}
+
+type SkillExecutionResult = {
+  skill: Skill
+  selected_script: {
+    name: string
+    path: string
+    runner: string
+  }
+  task: Task
+  execution: ExecutionRecord
+}
+
+type HermesAction = {
+  kind: string
+  title: string
+  detail: string
+}
+
+type HermesToolEvent = {
+  tool: string
+  detail: string
+}
+
+type HermesTaskStrategyTrace = {
+  task_title: string
+  strategy_sources: string[]
+}
+
+type HermesStrategyTrace = {
+  response_sources: string[]
+  task_sources: HermesTaskStrategyTrace[]
+}
+
+type HermesAgentResponse = {
+  session: Session
+  assistant_message: string
+  routed_model: ModelRouteDecision
+  workspace_contexts: WorkspaceContextFile[]
+  strategic_clusters: LearningCluster[]
+  strategy_trace: HermesStrategyTrace
+  memory_hits: Memory[]
+  session_hits: SessionSearchResult[]
+  suggested_skills: Skill[]
+  suggested_tasks: Task[]
+  actions: HermesAction[]
+  tool_trace: HermesToolEvent[]
+  memory_written: Memory | null
 }
 
 type Overview = {
@@ -110,37 +267,78 @@ const initialMemoryForm = {
   tags: 'preference, local-first',
 }
 
+const initialHermesPrompt = '请复刻 hermes-agent，并给我一个适合在 AgentOS 中落地的实现方案。'
+
 function App() {
   const [overview, setOverview] = useState<Overview | null>(null)
   const [tools, setTools] = useState<{ tools: Tool[]; skills: Skill[] }>({ tools: [], skills: [] })
   const [tasks, setTasks] = useState<Task[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [memories, setMemories] = useState<Memory[]>([])
+  const [workspaceContexts, setWorkspaceContexts] = useState<WorkspaceContextFile[]>([])
   const [selectedTaskId, setSelectedTaskId] = useState<string>('')
   const [executions, setExecutions] = useState<ExecutionRecord[]>([])
+  const [learningReports, setLearningReports] = useState<TaskLearningReport[]>([])
+  const [learningSummary, setLearningSummary] = useState<LearningSummary | null>(null)
+  const [strategyTimeline, setStrategyTimeline] = useState<StrategyTimeline | null>(null)
+  const [learningMessage, setLearningMessage] = useState('')
   const [taskForm, setTaskForm] = useState(initialTaskForm)
   const [memoryForm, setMemoryForm] = useState(initialMemoryForm)
   const [taskMessage, setTaskMessage] = useState('')
   const [memoryMessage, setMemoryMessage] = useState('')
   const [runMessage, setRunMessage] = useState('')
+  const [sessionQuery, setSessionQuery] = useState('')
+  const [sessionResults, setSessionResults] = useState<SessionSearchResult[]>([])
+  const [sessionMessage, setSessionMessage] = useState('')
+  const [routeCapability, setRouteCapability] = useState('code')
+  const [preferLocal, setPreferLocal] = useState(true)
+  const [routeDecision, setRouteDecision] = useState<ModelRouteDecision | null>(null)
+  const [routeMessage, setRouteMessage] = useState('')
+  const [selectedSkillId, setSelectedSkillId] = useState('')
+  const [selectedSkillScript, setSelectedSkillScript] = useState('')
+  const [skillArgs, setSkillArgs] = useState('')
+  const [skillMessage, setSkillMessage] = useState('')
+  const [skillResult, setSkillResult] = useState<SkillExecutionResult | null>(null)
+  const [hermesPrompt, setHermesPrompt] = useState(initialHermesPrompt)
+  const [hermesSessionId, setHermesSessionId] = useState<string>('')
+  const [hermesMessage, setHermesMessage] = useState('')
+  const [hermesResult, setHermesResult] = useState<HermesAgentResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
 
   const refreshDashboard = async (preserveTaskId?: string) => {
-    const [overviewRes, toolsRes, tasksRes, sessionsRes, memoriesRes] = await Promise.all([
+    const [overviewRes, toolsRes, tasksRes, sessionsRes, memoriesRes, contextsRes, learningSummaryRes, strategyTimelineRes] = await Promise.all([
       fetch('/api/v1/overview'),
       fetch('/api/v1/tools'),
       fetch('/api/v1/tasks'),
       fetch('/api/v1/sessions'),
       fetch('/api/v1/memories'),
+      fetch('/api/v1/contexts', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ working_dir: '/root/space' }),
+      }),
+      fetch('/api/v1/learning/summary', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ working_dir: '/root/space' }),
+      }),
+      fetch('/api/v1/learning/timeline', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ working_dir: '/root/space', limit: 12 }),
+      }),
     ])
 
-    const [overviewJson, toolsJson, tasksJson, sessionsJson, memoriesJson] = await Promise.all([
+    const [overviewJson, toolsJson, tasksJson, sessionsJson, memoriesJson, contextsJson, learningSummaryJson, strategyTimelineJson] = await Promise.all([
       overviewRes.json(),
       toolsRes.json(),
       tasksRes.json(),
       sessionsRes.json(),
       memoriesRes.json(),
+      contextsRes.json(),
+      learningSummaryRes.json(),
+      strategyTimelineRes.json(),
     ])
 
     setOverview(overviewJson)
@@ -148,16 +346,22 @@ function App() {
     setTasks(tasksJson)
     setSessions(sessionsJson)
     setMemories(memoriesJson)
+    setWorkspaceContexts(contextsJson)
+    setLearningSummary(learningSummaryJson)
+    setStrategyTimeline(strategyTimelineJson)
 
     const nextTaskId = preserveTaskId || selectedTaskId || tasksJson[0]?.id || ''
     if (nextTaskId) {
       setSelectedTaskId(nextTaskId)
       const executionRes = await fetch(`/api/v1/tasks/${nextTaskId}/executions`)
       if (executionRes.ok) {
-        setExecutions(await executionRes.json())
+        const executionJson: TaskExecutionInsights = await executionRes.json()
+        setExecutions(executionJson.executions)
+        setLearningReports(executionJson.learning_reports)
       }
     } else {
       setExecutions([])
+      setLearningReports([])
     }
   }
 
@@ -177,9 +381,20 @@ function App() {
 
     fetch(`/api/v1/tasks/${selectedTaskId}/executions`)
       .then((response) => response.json())
-      .then((data) => setExecutions(data))
+      .then((data: TaskExecutionInsights) => {
+        setExecutions(data.executions)
+        setLearningReports(data.learning_reports)
+      })
       .catch((error) => console.error('failed to load executions', error))
   }, [selectedTaskId])
+
+  useEffect(() => {
+    if (selectedSkillId || tools.skills.length === 0) {
+      return
+    }
+    setSelectedSkillId(tools.skills[0].id)
+    setSelectedSkillScript(tools.skills[0].scripts[0]?.name ?? '')
+  }, [selectedSkillId, tools.skills])
 
   const statValues = useMemo(() => {
     if (!overview) {
@@ -200,6 +415,7 @@ function App() {
   }, [overview])
 
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) ?? null
+  const selectedSkill = tools.skills.find((skill) => skill.id === selectedSkillId) ?? null
 
   const handleCreateTask = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -312,6 +528,179 @@ function App() {
     }
   }
 
+  const handleSearchSessions = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBusy(true)
+    setSessionMessage('')
+
+    try {
+      const response = await fetch('/api/v1/sessions/search', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ query: sessionQuery, limit: 6 }),
+      })
+      if (!response.ok) {
+        throw new Error(await response.text())
+      }
+      const results: SessionSearchResult[] = await response.json()
+      setSessionResults(results)
+      setSessionMessage(results.length === 0 ? '没有命中会话消息。' : `命中 ${results.length} 条会话消息`)
+    } catch (error) {
+      setSessionMessage(`检索失败: ${String(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRouteModel = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    setBusy(true)
+    setRouteMessage('')
+
+    try {
+      const response = await fetch('/api/v1/models/route', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ capability: routeCapability, prefer_local: preferLocal }),
+      })
+      if (!response.ok) {
+        throw new Error(await response.text())
+      }
+      const decision: ModelRouteDecision = await response.json()
+      setRouteDecision(decision)
+      setRouteMessage(`已为 ${routeCapability} 能力完成路由`) 
+    } catch (error) {
+      setRouteMessage(`路由失败: ${String(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleSetDefaultModel = async (modelId: string) => {
+    setBusy(true)
+    setRouteMessage('')
+
+    try {
+      const response = await fetch('/api/v1/models/default', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model_id: modelId }),
+      })
+      if (!response.ok) {
+        throw new Error(await response.text())
+      }
+      setRouteMessage(`默认模型已切换为 ${modelId}`)
+      await refreshDashboard(selectedTaskId)
+    } catch (error) {
+      setRouteMessage(`切换失败: ${String(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRunSkill = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!selectedSkillId) {
+      setSkillMessage('先选择一个 Skill。')
+      return
+    }
+
+    setBusy(true)
+    setSkillMessage('')
+
+    try {
+      const response = await fetch(`/api/v1/skills/${encodeURIComponent(selectedSkillId)}/run`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          script_name: selectedSkillScript || undefined,
+          args: skillArgs.split(' ').map((item) => item.trim()).filter(Boolean),
+          sandbox_profile: 'workspace-write',
+          working_dir: '/root/space',
+        }),
+      })
+      if (!response.ok) {
+        throw new Error(await response.text())
+      }
+      const result: SkillExecutionResult = await response.json()
+      setSkillResult(result)
+      setSkillMessage(`Skill ${result.skill.id} 已执行`)
+      setSelectedTaskId(result.task.id)
+      await refreshDashboard(result.task.id)
+    } catch (error) {
+      setSkillMessage(`Skill 执行失败: ${String(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleHermesChat = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!hermesPrompt.trim()) {
+      setHermesMessage('先输入一条 Hermes 指令。')
+      return
+    }
+
+    setBusy(true)
+    setHermesMessage('')
+
+    try {
+      const response = await fetch('/api/v1/agent/hermes/chat', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          session_id: hermesSessionId || undefined,
+          title: 'Hermes Replica Session',
+          working_dir: '/root/space',
+          message: hermesPrompt,
+          auto_persist_memory: true,
+        }),
+      })
+      if (!response.ok) {
+        throw new Error(await response.text())
+      }
+
+      const result: HermesAgentResponse = await response.json()
+      setHermesResult(result)
+      setHermesSessionId(result.session.id)
+      setHermesMessage(`Hermes loop 已完成，使用模型 ${result.routed_model.selected.id}`)
+      await refreshDashboard(selectedTaskId)
+    } catch (error) {
+      setHermesMessage(`Hermes 调用失败: ${String(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handlePromoteSkillCandidate = async (candidateId: string, taskId?: string, clusterKey?: string) => {
+    setBusy(true)
+    setLearningMessage('')
+
+    try {
+      const response = await fetch('/api/v1/skills/promote', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          task_id: taskId || undefined,
+          cluster_key: clusterKey || undefined,
+          candidate_id: candidateId,
+          working_dir: '/root/space',
+        }),
+      })
+      if (!response.ok) {
+        throw new Error(await response.text())
+      }
+
+      const result: PromotedSkillResult = await response.json()
+      setLearningMessage(`已晋升 Skill ${result.skill.id}`)
+      await refreshDashboard(selectedTaskId)
+    } catch (error) {
+      setLearningMessage(`Skill 晋升失败: ${String(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   if (loading) {
     return <main className="loading-shell">Booting AgentOS...</main>
   }
@@ -322,7 +711,7 @@ function App() {
         <div className="hero-copy">
           <span className="eyebrow">Single-node agent kernel</span>
           <h1>AgentOS</h1>
-          <p>把任务调度、会话压缩、长期记忆、工具热加载和模型路由收敛到一个本地节点里。</p>
+          <p>参考 Hermes 的会话搜索、技能发现和模型路由思路，把任务调度、长期记忆与可审计执行收敛到一个本地节点。</p>
         </div>
         <div className="hero-orbit">
           <div className="ring ring-a" />
@@ -330,7 +719,7 @@ function App() {
           <div className="core-card">
             <span>Node</span>
             <strong>{overview?.node_name ?? 'agentos-local-node'}</strong>
-            <small>local-first / auditable / sandbox-aware</small>
+            <small>local-first / searchable / skill-aware</small>
           </div>
         </div>
       </section>
@@ -385,6 +774,23 @@ function App() {
                   <span>{memory.scope}</span>
                 </div>
               ))}
+            </div>
+            <div className="lane-card accent-gold">
+              <h3>Context Files</h3>
+              <p>Codex / Hermes 工作区上下文</p>
+              {workspaceContexts.length === 0 ? (
+                <div className="line-item">
+                  <strong>无上下文文件</strong>
+                  <span>可添加 `AGENTS.md` / `SOUL.md` / `MEMORY.md`</span>
+                </div>
+              ) : (
+                workspaceContexts.slice(0, 3).map((context) => (
+                  <div key={context.path} className="line-item">
+                    <strong>{context.title}</strong>
+                    <span>{context.kind} / {context.path}</span>
+                  </div>
+                ))
+              )}
             </div>
           </div>
         </article>
@@ -450,6 +856,9 @@ function App() {
                     <strong>{selectedTask.title}</strong>
                     <span>{selectedTask.command.program} {selectedTask.command.args.join(' ')}</span>
                     <small>{selectedTask.working_dir}</small>
+                    {selectedTask.strategy_sources.length > 0 ? (
+                      <small>strategy: {selectedTask.strategy_sources.join(' / ')}</small>
+                    ) : null}
                   </div>
                   <div className="button-row">
                     <button className="primary-button" disabled={busy} type="button" onClick={() => handleRunTask(selectedTask.id)}>
@@ -482,6 +891,22 @@ function App() {
                       </div>
                       <code>{item.command_line}</code>
                       <pre>{item.stdout || item.stderr || 'no output'}</pre>
+                    </article>
+                  ))
+                )}
+              </div>
+              <div className="execution-list">
+                {learningReports.length === 0 ? (
+                  <p className="muted-copy">该任务还没有学习沉淀。</p>
+                ) : (
+                  learningReports.slice(0, 2).map((report) => (
+                    <article key={report.id} className="execution-card">
+                      <div className="execution-meta">
+                        <strong>learning / {report.status}</strong>
+                        <span>{new Date(report.created_at).toLocaleString()}</span>
+                      </div>
+                      <p>{report.recap}</p>
+                      <small>{report.lessons.join(' · ')}</small>
                     </article>
                   ))
                 )}
@@ -544,12 +969,356 @@ function App() {
           </div>
           <div className="stack-list compact">
             {tools.skills.map((skill) => (
-              <div key={skill.id} className="stack-card">
+              <button
+                key={skill.id}
+                className={`stack-card action-line${selectedSkillId === skill.id ? ' selected' : ''}`}
+                onClick={() => {
+                  setSelectedSkillId(skill.id)
+                  setSelectedSkillScript(skill.scripts[0]?.name ?? '')
+                }}
+                type="button"
+              >
                 <div>
                   <strong>{skill.id}</strong>
-                  <span>{skill.trigger}</span>
+                  <span>{skill.source}</span>
                 </div>
                 <p>{skill.description}</p>
+                <small>{skill.scripts.length > 0 ? `${skill.scripts.length} scripts · ${skill.path}` : `no scripts · ${skill.path}`}</small>
+              </button>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel">
+          <div className="panel-head">
+            <h2>Skill Runner</h2>
+            <span>{selectedSkill ? selectedSkill.id : '选择左侧 Skill'}</span>
+          </div>
+          <form className="action-form" onSubmit={handleRunSkill}>
+            {selectedSkill ? (
+              <>
+                <div className="selected-task-card">
+                  <strong>{selectedSkill.id}</strong>
+                  <span>{selectedSkill.description}</span>
+                  <small>{selectedSkill.path}</small>
+                </div>
+                <label>
+                  脚本
+                  <select value={selectedSkillScript} onChange={(event) => setSelectedSkillScript(event.target.value)}>
+                    {selectedSkill.scripts.length === 0 ? (
+                      <option value="">no runnable scripts</option>
+                    ) : (
+                      selectedSkill.scripts.map((script) => (
+                        <option key={script.name} value={script.name}>
+                          {script.name} / {script.runner}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                </label>
+                <label>
+                  参数
+                  <input placeholder="例如: my-plugin --with-skills" value={skillArgs} onChange={(event) => setSkillArgs(event.target.value)} />
+                </label>
+                <button className="primary-button alt" disabled={busy || selectedSkill.scripts.length === 0} type="submit">
+                  执行 Skill
+                </button>
+              </>
+            ) : (
+              <p className="muted-copy">从 Skill Registry 里选择一个可执行 Skill。</p>
+            )}
+            {skillMessage ? <p className="feedback-text">{skillMessage}</p> : null}
+            {skillResult ? (
+              <article className="execution-card">
+                <div className="execution-meta">
+                  <strong>{skillResult.execution.status}</strong>
+                  <span>{skillResult.selected_script.runner} / {skillResult.execution.duration_ms} ms</span>
+                </div>
+                <code>{skillResult.execution.command_line}</code>
+                <pre>{skillResult.execution.stdout || skillResult.execution.stderr || 'no output'}</pre>
+              </article>
+            ) : null}
+          </form>
+        </article>
+
+        <article className="panel panel-wide">
+          <div className="panel-head">
+            <h2>Hermes Replica</h2>
+            <span>{hermesSessionId ? `session ${hermesSessionId.slice(0, 8)}` : '本地 agent loop'}</span>
+          </div>
+          <form className="action-form" onSubmit={handleHermesChat}>
+            <label>
+              指令
+              <textarea value={hermesPrompt} onChange={(event) => setHermesPrompt(event.target.value)} rows={4} />
+            </label>
+            <button className="primary-button" disabled={busy} type="submit">运行 Hermes Loop</button>
+            {hermesMessage ? <p className="feedback-text">{hermesMessage}</p> : null}
+          </form>
+          {hermesResult ? (
+            <div className="console-grid">
+              <article className="execution-card">
+                <div className="execution-meta">
+                  <strong>{hermesResult.routed_model.selected.id}</strong>
+                  <span>{hermesResult.routed_model.reason}</span>
+                </div>
+                <pre>{hermesResult.assistant_message}</pre>
+              </article>
+              <div className="stack-list compact">
+                {hermesResult.workspace_contexts.map((context) => (
+                  <div key={context.path} className="stack-card">
+                    <div>
+                      <strong>{context.title}</strong>
+                      <span>{context.kind}</span>
+                    </div>
+                    <p>{context.guidance.join(' · ') || context.excerpt}</p>
+                    <small>{context.path}</small>
+                  </div>
+                ))}
+              </div>
+              <div className="stack-list compact">
+                {hermesResult.strategic_clusters.map((cluster) => (
+                  <div key={cluster.key} className="stack-card">
+                    <div>
+                      <strong>{cluster.title}</strong>
+                      <span>{cluster.capability} / {Math.round(cluster.success_rate * 100)}%</span>
+                    </div>
+                    <p>{cluster.common_lessons.join(' · ')}</p>
+                    <small>{cluster.report_count} reports · weight {cluster.strategic_weight.toFixed(1)}</small>
+                    <small>source feedback: {cluster.source_usage_count} uses / {Math.round(cluster.source_success_rate * 100)}% success</small>
+                    <small>state: {cluster.suppression_level}{cluster.pruned_from_planning ? ' / pruned' : ''}</small>
+                  </div>
+                ))}
+              </div>
+              <div className="stack-list compact">
+                {hermesResult.actions.map((action) => (
+                  <div key={`${action.kind}-${action.title}`} className="stack-card">
+                    <div>
+                      <strong>{action.title}</strong>
+                      <span>{action.kind}</span>
+                    </div>
+                    <p>{action.detail}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="stack-list compact">
+                <div className="stack-card">
+                  <div>
+                    <strong>Strategy Trace</strong>
+                    <span>provenance</span>
+                  </div>
+                  <p>
+                    {hermesResult.strategy_trace.response_sources.length > 0
+                      ? hermesResult.strategy_trace.response_sources.join(' · ')
+                      : 'no response-level strategy sources'}
+                  </p>
+                  <small>
+                    {hermesResult.strategy_trace.task_sources.length > 0
+                      ? hermesResult.strategy_trace.task_sources
+                          .map((item) => `${item.task_title}: ${item.strategy_sources.join(', ') || 'none'}`)
+                          .join(' || ')
+                      : 'no task-level strategy sources'}
+                  </small>
+                </div>
+              </div>
+              <div className="stack-list compact">
+                {hermesResult.tool_trace.map((event) => (
+                  <div key={`${event.tool}-${event.detail}`} className="stack-card">
+                    <div>
+                      <strong>{event.tool}</strong>
+                      <span>tool trace</span>
+                    </div>
+                    <p>{event.detail}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </article>
+
+        <article className="panel panel-wide">
+          <div className="panel-head">
+            <h2>Learning Loop</h2>
+            <span>task recap / memory / skill candidates</span>
+          </div>
+          {learningMessage ? <p className="feedback-text">{learningMessage}</p> : null}
+          <div className="console-grid">
+            {learningReports.length === 0 ? (
+              <div className="stack-card">
+                <div>
+                  <strong>暂无自学习结果</strong>
+                  <span>autopilot</span>
+                </div>
+                <p>任务执行完成后，AgentOS 会自动写入 episodic memory、更新 recap session，并生成 skill 候选。</p>
+              </div>
+            ) : (
+              learningReports.slice(0, 3).map((report) => (
+                <div key={report.id} className="stack-card">
+                  <div>
+                    <strong>{report.status}</strong>
+                    <span>{new Date(report.created_at).toLocaleString()}</span>
+                  </div>
+                  <p>{report.recap}</p>
+                  <small>{report.lessons.join(' · ')}</small>
+                  {report.source_strategy_keys.length > 0 ? (
+                    <small>sources: {report.source_strategy_keys.join(' / ')}</small>
+                  ) : null}
+                  {report.skill_candidates.length > 0 ? (
+                    <div className="stack-list compact">
+                      {report.skill_candidates.map((item) => (
+                        <div key={item.id} className="selected-task-card">
+                          <strong>{item.title}</strong>
+                          <span>{item.suggested_trigger}</span>
+                          <small>{item.rationale}</small>
+                          <button
+                            className="secondary-button"
+                            disabled={busy}
+                            onClick={() => handlePromoteSkillCandidate(item.id, report.task_id)}
+                            type="button"
+                          >
+                            晋升为 Skill
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ))
+            )}
+          </div>
+        </article>
+
+        <article className="panel panel-wide">
+          <div className="panel-head">
+            <h2>Strategic Learning</h2>
+            <span>{learningSummary ? `${learningSummary.total_reports} reports clustered` : 'clustered experience'}</span>
+          </div>
+          <div className="stack-list compact">
+            {!learningSummary || learningSummary.clusters.length === 0 ? (
+              <div className="stack-card">
+                <div>
+                  <strong>暂无长期经验簇</strong>
+                  <span>strategic memory</span>
+                </div>
+                <p>当相似任务累计两次以上后，AgentOS 会把 learning reports 聚类，生成更高层的长期经验与战略 Skill 候选。</p>
+              </div>
+            ) : (
+              learningSummary.clusters.slice(0, 6).map((cluster) => (
+                <div key={cluster.key} className="stack-card">
+                  <div>
+                    <strong>{cluster.title}</strong>
+                    <span>{cluster.capability} / {Math.round(cluster.success_rate * 100)}%</span>
+                  </div>
+                  <p>{cluster.common_lessons.join(' · ')}</p>
+                  <small>
+                    {cluster.report_count} reports · weight {cluster.strategic_weight.toFixed(1)} · recency {cluster.recency_score.toFixed(2)}
+                  </small>
+                  <small>
+                    source feedback: {cluster.source_usage_count} uses / {Math.round(cluster.source_success_rate * 100)}% success
+                  </small>
+                  <small>state: {cluster.suppression_level}{cluster.pruned_from_planning ? ' / pruned' : ''}</small>
+                  <small>tasks: {cluster.example_tasks.join(' / ')}</small>
+                  {cluster.recommended_commands.length > 0 ? (
+                    <small>Commands: {cluster.recommended_commands.join(' || ')}</small>
+                  ) : null}
+                  {cluster.strategic_skill_candidates.map((candidate) => (
+                    <div key={candidate.id} className="selected-task-card">
+                      <strong>{candidate.title}</strong>
+                      <span>{candidate.suggested_trigger}</span>
+                      <small>{candidate.rationale}</small>
+                      <button
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={() => handlePromoteSkillCandidate(candidate.id, undefined, cluster.key)}
+                        type="button"
+                      >
+                        晋升战略 Skill
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ))
+            )}
+          </div>
+        </article>
+
+        <article className="panel panel-wide">
+          <div className="panel-head">
+            <h2>Strategy Timeline</h2>
+            <span>{strategyTimeline ? `${strategyTimeline.total_events} evaluation events` : 'evaluation events'}</span>
+          </div>
+          <div className="stack-list compact">
+            {!strategyTimeline || strategyTimeline.events.length === 0 ? (
+              <div className="stack-card">
+                <div>
+                  <strong>暂无策略评估事件</strong>
+                  <span>timeline</span>
+                </div>
+                <p>任务执行采用 `strategy_sources` 后，这里会记录哪些经验簇被验证、证伪或持续命中。</p>
+              </div>
+            ) : (
+              strategyTimeline.events.map((event) => (
+                <div key={event.id} className="stack-card">
+                  <div>
+                    <strong>{event.strategy_source_key}</strong>
+                    <span>{event.outcome_status}</span>
+                  </div>
+                  <p>{event.summary}</p>
+                  <small>{event.evidence}</small>
+                  <small>{new Date(event.created_at).toLocaleString()}</small>
+                </div>
+              ))
+            )}
+          </div>
+        </article>
+
+        <article className="panel panel-wide">
+          <div className="panel-head">
+            <h2>Workspace Context</h2>
+            <span>Codex AGENTS.md + Hermes SOUL/MEMORY</span>
+          </div>
+          <div className="stack-list compact">
+            {workspaceContexts.length === 0 ? (
+              <div className="stack-card">
+                <div>
+                  <strong>暂无工作区上下文</strong>
+                  <span>context layer</span>
+                </div>
+                <p>在工作区根目录放置 `AGENTS.md`、`SOUL.md`、`MEMORY.md` 或 `USER.md` 后，这里会自动被 AgentOS 发现并注入到 Hermes Loop。</p>
+              </div>
+            ) : (
+              workspaceContexts.map((context) => (
+                <div key={context.path} className="stack-card">
+                  <div>
+                    <strong>{context.title}</strong>
+                    <span>{context.kind}</span>
+                  </div>
+                  <p>{context.excerpt || context.guidance.join(' · ')}</p>
+                  <small>{context.path}</small>
+                </div>
+              ))
+            )}
+          </div>
+        </article>
+
+        <article className="panel panel-wide">
+          <div className="panel-head">
+            <h2>Session Search</h2>
+            <span>FTS + LIKE fallback</span>
+          </div>
+          <form className="search-bar" onSubmit={handleSearchSessions}>
+            <input placeholder="检索历史消息，如：技能发现 / 本地执行 / 模型路由" value={sessionQuery} onChange={(event) => setSessionQuery(event.target.value)} />
+            <button className="primary-button alt" disabled={busy || !sessionQuery.trim()} type="submit">搜索</button>
+          </form>
+          {sessionMessage ? <p className="feedback-text">{sessionMessage}</p> : null}
+          <div className="stack-list compact">
+            {sessionResults.map((result) => (
+              <div key={`${result.session_id}-${result.created_at}`} className="stack-card">
+                <div>
+                  <strong>{result.title}</strong>
+                  <span>{result.role} / {result.score.toFixed(2)}</span>
+                </div>
+                <p>{result.excerpt}</p>
+                <small>{result.working_dir}</small>
               </div>
             ))}
           </div>
@@ -560,13 +1329,43 @@ function App() {
             <h2>Model Router</h2>
             <span>本地优先，多模型回退</span>
           </div>
+          <form className="router-toolbar" onSubmit={handleRouteModel}>
+            <select value={routeCapability} onChange={(event) => setRouteCapability(event.target.value)}>
+              <option value="chat">chat</option>
+              <option value="code">code</option>
+              <option value="summarize">summarize</option>
+              <option value="planning">planning</option>
+              <option value="tools">tools</option>
+            </select>
+            <label className="toggle-line">
+              <input checked={preferLocal} onChange={(event) => setPreferLocal(event.target.checked)} type="checkbox" />
+              优先本地模型
+            </label>
+            <button className="primary-button" disabled={busy} type="submit">执行路由</button>
+          </form>
+          {routeMessage ? <p className="feedback-text">{routeMessage}</p> : null}
+          {routeDecision ? (
+            <div className="route-decision">
+              <div className="selected-task-card">
+                <strong>{routeDecision.selected.id}</strong>
+                <span>{routeDecision.selected.kind} / weight {routeDecision.selected.routing_weight}</span>
+                <small>{routeDecision.reason}</small>
+              </div>
+              {routeDecision.fallbacks.length > 0 ? (
+                <p className="muted-copy">Fallbacks: {routeDecision.fallbacks.map((model) => model.id).join(' -> ')}</p>
+              ) : null}
+            </div>
+          ) : null}
           <div className="model-grid">
             {overview?.models.map((model) => (
               <div key={model.id} className={`model-card${model.is_default ? ' active' : ''}`}>
                 <span>{model.kind}</span>
                 <strong>{model.id}</strong>
                 <p>{model.endpoint}</p>
-                <small>{model.capabilities.join(' / ')}</small>
+                <small>{model.capabilities.join(' / ')} / weight {model.routing_weight}</small>
+                <button className="secondary-button" disabled={busy || model.is_default} onClick={() => handleSetDefaultModel(model.id)} type="button">
+                  {model.is_default ? '当前默认' : '设为默认'}
+                </button>
               </div>
             ))}
           </div>
